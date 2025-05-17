@@ -6,6 +6,7 @@ import (
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
+	"html/template"
 	"log"
 	"os"
 	"regexp"
@@ -29,22 +30,76 @@ const (
 	baseRetrySleep   = time.Second
 	apiRateDelayMs   = 50
 	csvFileBaseName  = "walmart_order_stats"
+	htmlFileBaseName = "walmart_order_report"
 )
 
-type Order struct {
-	MsgID       string
+// ReportData holds all data for the HTML template
+type ReportData struct {
+	Timestamp             string
+	Overall               OverallStatsData
+	ProductStats          []ProductStatData
+	ShippedOrders         []ShippedOrderData
+	PendingShipmentOrders []PendingShipmentData
+	EmailStats            EmailStatsDataContainer
+}
+
+type OverallStatsData struct {
+	TotalConfirmations int
+	TotalCancellations int
+	TotalNonCancelled  int
+	TotalShipped       int
+}
+
+type ProductStatData struct {
+	Name        string
+	Confirmed   int
+	NonCanceled int
+	Shipped     int
+	StickRate   float64
+}
+
+type ShippedOrderData struct {
+	Email          string
+	OrderID        string
+	ProductName    string
+	TrackingNumber string
+}
+
+type PendingShipmentData struct {
 	Email       string
 	OrderID     string
 	ProductName string
-	IsCanceled  bool
-	Subject     string
+}
+
+type EmailStatData struct {
+	Email              string
+	NonCanceled        int
+	TotalCancellations int
+}
+
+type EmailStatsDataContainer struct {
+	TopNonCancelled   []EmailStatData
+	OnlyCancellations []EmailStatData
+}
+
+type Order struct {
+	MsgID          string
+	Email          string
+	OrderID        string
+	ProductName    string
+	IsCanceled     bool
+	IsShipped      bool
+	TrackingNumber string
+	Subject        string
 }
 
 var (
 	reOrderConfirmation = regexp.MustCompile(`(?i)thanks for your order|order confirmation`)
 	reOrderCancellation = regexp.MustCompile(`(?i)Canceled:.*?order #([\d-]+)|your order.*?has been canceled`)
+	reOrderShipped      = regexp.MustCompile(`(?i)Shipped:`)
 	reOrderNumber       = regexp.MustCompile(`Order number:.*?(\d{7}-\d{8})`)
-	reProductName       = regexp.MustCompile(`quantity \d+ item (.*)`)
+	reProductName       = regexp.MustCompile(`quantity \d+ item ([^"<]+)`)
+	reTrackingNumber    = regexp.MustCompile(`(?i)tracking number <a[^>]*>([^<]+)</a>`)
 )
 
 func main() {
@@ -63,7 +118,9 @@ func main() {
 	orders := processEmails(srv, messageIDs)
 	log.Printf("Processed %d orders from emails\n", len(orders))
 
-	writeStats(orders)
+	reportData := generateReportData(orders)
+	writeCSVStats(reportData) // Renamed from writeStats
+	writeHTMLReport(reportData)
 }
 
 func initGmailService(ctx context.Context) *gmail.Service {
@@ -274,24 +331,56 @@ func processSingleEmail(srv *gmail.Service, msgID string, workerID int) (Order, 
 		return order, true
 	}
 
-	if reOrderConfirmation.MatchString(subject) {
-		order.IsCanceled = false
-
+	if reOrderShipped.MatchString(subject) {
+		order.IsShipped = true
 		if body != "" {
 			if matches := reOrderNumber.FindStringSubmatch(body); len(matches) > 1 {
 				order.OrderID = strings.ReplaceAll(matches[1], "-", "")
 			}
+			order.ProductName = extractProductName(body)
+			if matches := reTrackingNumber.FindStringSubmatch(body); len(matches) > 1 {
+				order.TrackingNumber = strings.TrimSpace(matches[1])
+			}
+		}
+		if order.OrderID == "" { // Fallback if not found in body, check subject (though less likely for shipped)
+			// Attempt to find order number in subject for shipped emails if not in body
+			// This part might need adjustment based on actual shipped email subject format for order numbers
+			// For now, we assume it's primarily in the body like confirmations.
+			// If not found, it will be "unknown_MSGID"
+			subjectOrderMatches := reOrderNumber.FindStringSubmatch(subject) // Example, might not be correct
+			if len(subjectOrderMatches) > 1 {
+				order.OrderID = strings.ReplaceAll(subjectOrderMatches[1], "-", "")
+			} else {
+				order.OrderID = "unknown_shipped_" + msgID
+			}
+		}
+		if order.ProductName == "" {
+			order.ProductName = "Unknown Product (Shipped)"
+		}
+		if order.TrackingNumber == "" {
+			order.TrackingNumber = "N/A"
+		}
+		log.Printf("[Worker %d] Found shipment: Order %s, Product '%s', Tracking '%s' for %s",
+			workerID, order.OrderID, order.ProductName, order.TrackingNumber, order.Email)
+		return order, true
+	}
 
+	if reOrderConfirmation.MatchString(subject) {
+		order.IsCanceled = false // Explicitly false for confirmations
+		order.IsShipped = false  // Explicitly false for confirmations
+		if body != "" {
+			if matches := reOrderNumber.FindStringSubmatch(body); len(matches) > 1 {
+				order.OrderID = strings.ReplaceAll(matches[1], "-", "")
+			}
 			order.ProductName = extractProductName(body)
 		}
 
 		if order.OrderID == "" {
-			order.OrderID = "unknown_" + msgID
+			order.OrderID = "unknown_confirm_" + msgID
 		}
 		if order.ProductName == "" {
 			order.ProductName = "Unknown Product"
 		}
-
 		log.Printf("[Worker %d] Found confirmation: Order %s, Product '%s' for %s",
 			workerID, order.OrderID, order.ProductName, order.Email)
 		return order, true
@@ -363,14 +452,16 @@ func extractProductName(body string) string {
 	return "Unknown Product"
 }
 
-func writeStats(orders []Order) {
+func generateReportData(orders []Order) ReportData {
+	reportTimestamp := time.Now().Format(time.RFC1123)
 	if len(orders) == 0 {
-		log.Println("No orders to process")
-		return
+		log.Println("No orders to process for report data generation")
+		return ReportData{Timestamp: reportTimestamp} // Return empty report with timestamp
 	}
 
-	confirmedByEmail := make(map[string]map[string]string)
-	canceledByEmail := make(map[string]map[string]bool)
+	confirmedByEmail := make(map[string]map[string]string) // email -> orderID -> productName
+	canceledByEmail := make(map[string]map[string]bool)    // email -> orderID -> true
+	shippedOrdersInfo := make(map[string]map[string]Order) // email -> orderID -> Order (with tracking)
 
 	for _, order := range orders {
 		if order.IsCanceled {
@@ -378,7 +469,18 @@ func writeStats(orders []Order) {
 				canceledByEmail[order.Email] = make(map[string]bool)
 			}
 			canceledByEmail[order.Email][order.OrderID] = true
-		} else {
+		} else if order.IsShipped {
+			if _, exists := shippedOrdersInfo[order.Email]; !exists {
+				shippedOrdersInfo[order.Email] = make(map[string]Order)
+			}
+			shippedOrdersInfo[order.Email][order.OrderID] = order
+			if _, exists := confirmedByEmail[order.Email]; !exists {
+				confirmedByEmail[order.Email] = make(map[string]string)
+			}
+			if _, productExists := confirmedByEmail[order.Email][order.OrderID]; !productExists {
+				confirmedByEmail[order.Email][order.OrderID] = order.ProductName
+			}
+		} else { // Is a confirmation
 			if _, exists := confirmedByEmail[order.Email]; !exists {
 				confirmedByEmail[order.Email] = make(map[string]string)
 			}
@@ -386,189 +488,294 @@ func writeStats(orders []Order) {
 		}
 	}
 
-	productStats := make(map[string]struct {
-		Confirmed   int
-		NonCanceled int
-	})
-
+	// Overall Stats Calculation
+	var overallData OverallStatsData
+	for _, orderMap := range confirmedByEmail {
+		overallData.TotalConfirmations += len(orderMap)
+	}
+	for _, cancelMap := range canceledByEmail {
+		overallData.TotalCancellations += len(cancelMap)
+	}
 	for email, orderMap := range confirmedByEmail {
-		for orderID, product := range orderMap {
-			canceled := false
-			if cancelMap, exists := canceledByEmail[email]; exists {
-				if _, wasCanceled := cancelMap[orderID]; wasCanceled {
-					canceled = true
-				}
+		for orderID := range orderMap {
+			if cancelMap, exists := canceledByEmail[email]; !exists || !cancelMap[orderID] {
+				overallData.TotalNonCancelled++
 			}
-
-			stats := productStats[product]
-			stats.Confirmed++
-			if !canceled {
-				stats.NonCanceled++
-			}
-			productStats[product] = stats
 		}
 	}
+	for _, shippedMap := range shippedOrdersInfo {
+		overallData.TotalShipped += len(shippedMap)
+	}
 
+	// Product Stats Calculation
+	productStatsMap := make(map[string]struct {
+		Confirmed   int
+		NonCanceled int
+		Shipped     int
+	})
+	for email, orderMap := range confirmedByEmail {
+		for orderID, product := range orderMap {
+			isCanceled := false
+			if cancelMap, exists := canceledByEmail[email]; exists && cancelMap[orderID] {
+				isCanceled = true
+			}
+			currentStat := productStatsMap[product]
+			currentStat.Confirmed++
+			if !isCanceled {
+				currentStat.NonCanceled++
+			}
+			productStatsMap[product] = currentStat
+		}
+	}
+	for _, shippedMap := range shippedOrdersInfo {
+		for orderID, shippedOrder := range shippedMap {
+			productNameForStat := shippedOrder.ProductName
+			if productNameForStat == "" || strings.HasPrefix(productNameForStat, "Unknown Product") {
+				if confirmedEmail, ok := confirmedByEmail[shippedOrder.Email]; ok {
+					if pName, pOk := confirmedEmail[orderID]; pOk && pName != "" && !strings.HasPrefix(pName, "Unknown Product") {
+						productNameForStat = pName
+					}
+				}
+			}
+			if productNameForStat == "" {
+				productNameForStat = "Unknown Product (Shipped)"
+			}
+			currentStat := productStatsMap[productNameForStat]
+			currentStat.Shipped++
+			productStatsMap[productNameForStat] = currentStat
+		}
+	}
+	var productStatsData []ProductStatData
+	for name, stat := range productStatsMap {
+		stickRate := 0.0
+		if stat.Confirmed > 0 {
+			stickRate = float64(stat.NonCanceled) / float64(stat.Confirmed) * 100
+		}
+		productStatsData = append(productStatsData, ProductStatData{
+			Name:        name,
+			Confirmed:   stat.Confirmed,
+			NonCanceled: stat.NonCanceled,
+			Shipped:     stat.Shipped,
+			StickRate:   stickRate,
+		})
+	}
+	sort.Slice(productStatsData, func(i, j int) bool {
+		return productStatsData[i].NonCanceled > productStatsData[j].NonCanceled
+	})
+
+	// Shipped Orders List
+	var shippedOrdersData []ShippedOrderData
+	for email, orderMap := range shippedOrdersInfo {
+		for orderID, orderDetails := range orderMap {
+			shippedOrdersData = append(shippedOrdersData, ShippedOrderData{
+				Email:          email,
+				OrderID:        orderID,
+				ProductName:    orderDetails.ProductName,
+				TrackingNumber: orderDetails.TrackingNumber,
+			})
+		}
+	}
+	sort.Slice(shippedOrdersData, func(i, j int) bool {
+		if shippedOrdersData[i].Email != shippedOrdersData[j].Email {
+			return shippedOrdersData[i].Email < shippedOrdersData[j].Email
+		}
+		return shippedOrdersData[i].OrderID < shippedOrdersData[j].OrderID
+	})
+
+	// Pending Shipment Orders List
+	var pendingShipmentData []PendingShipmentData
+	for email, orderMap := range confirmedByEmail {
+		for orderID, productName := range orderMap {
+			isCanceled := false
+			if cancelMap, exists := canceledByEmail[email]; exists && cancelMap[orderID] {
+				isCanceled = true
+			}
+			isShipped := false
+			if shippedMap, exists := shippedOrdersInfo[email]; exists && shippedMap[orderID].MsgID != "" {
+				isShipped = true
+			}
+			if !isCanceled && !isShipped {
+				pendingShipmentData = append(pendingShipmentData, PendingShipmentData{
+					Email:       email,
+					OrderID:     orderID,
+					ProductName: productName,
+				})
+			}
+		}
+	}
+	sort.Slice(pendingShipmentData, func(i, j int) bool {
+		if pendingShipmentData[i].Email != pendingShipmentData[j].Email {
+			return pendingShipmentData[i].Email < pendingShipmentData[j].Email
+		}
+		return pendingShipmentData[i].OrderID < pendingShipmentData[j].OrderID
+	})
+
+	// Email Stats
+	allEmails := make(map[string]bool)
+	for email := range confirmedByEmail {
+		allEmails[email] = true
+	}
+	for email := range canceledByEmail {
+		allEmails[email] = true
+	}
+	var emailStatsList []EmailStatData
+	for email := range allEmails {
+		stat := EmailStatData{Email: email}
+		if confirmedOrders, exists := confirmedByEmail[email]; exists {
+			for orderID := range confirmedOrders {
+				if cancelMap, cExists := canceledByEmail[email]; !cExists || !cancelMap[orderID] {
+					stat.NonCanceled++
+				}
+			}
+		}
+		if cancelMap, exists := canceledByEmail[email]; exists {
+			stat.TotalCancellations = len(cancelMap)
+		}
+		emailStatsList = append(emailStatsList, stat)
+	}
+
+	var topNonCancelled []EmailStatData
+	var onlyCancellations []EmailStatData
+
+	sort.Slice(emailStatsList, func(i, j int) bool { // Sort once for TopNonCancelled
+		return emailStatsList[i].NonCanceled > emailStatsList[j].NonCanceled
+	})
+	for _, stat := range emailStatsList {
+		if stat.NonCanceled > 0 {
+			topNonCancelled = append(topNonCancelled, stat)
+		}
+		if stat.TotalCancellations > 0 && stat.NonCanceled == 0 {
+			onlyCancellations = append(onlyCancellations, stat)
+		}
+	}
+	// No need to re-sort for onlyCancellations unless a different sort order is desired for that specific list.
+
+	return ReportData{
+		Timestamp:             reportTimestamp,
+		Overall:               overallData,
+		ProductStats:          productStatsData,
+		ShippedOrders:         shippedOrdersData,
+		PendingShipmentOrders: pendingShipmentData,
+		EmailStats: EmailStatsDataContainer{
+			TopNonCancelled:   topNonCancelled,
+			OnlyCancellations: onlyCancellations,
+		},
+	}
+}
+
+func writeCSVStats(data ReportData) {
 	timestamp := time.Now().Format("20060102_150405")
 	filename := fmt.Sprintf("%s_%s.csv", csvFileBaseName, timestamp)
-
 	file, err := os.Create(filename)
 	if err != nil {
 		log.Fatalf("Failed to create CSV file: %v", err)
 	}
 	defer file.Close()
-
 	writer := csv.NewWriter(file)
 	defer writer.Flush()
 
-	writeOverallStats(writer, confirmedByEmail, canceledByEmail)
+	// Adapt existing write functions to use ReportData fields
+	writeOverallStatsCSV(writer, data.Overall)
+	writeProductStatsCSV(writer, data.ProductStats)
+	writeShippedOrdersListCSV(writer, data.ShippedOrders)
+	writePendingShipmentOrdersCSV(writer, data.PendingShipmentOrders)
+	writeEmailStatsCSV(writer, data.EmailStats)
 
-	writeProductStats(writer, productStats)
-
-	writeEmailStats(writer, confirmedByEmail, canceledByEmail)
-
-	log.Printf("Statistics written to %s", filename)
+	log.Printf("CSV statistics written to %s", filename)
 }
 
-func writeOverallStats(writer *csv.Writer, confirmed map[string]map[string]string, canceled map[string]map[string]bool) {
+func writeOverallStatsCSV(writer *csv.Writer, overall OverallStatsData) {
 	writer.Write([]string{"Overall Stats"})
 	writer.Write([]string{"Metric", "Count"})
 
-	totalConfirmations := 0
-	for _, orders := range confirmed {
-		totalConfirmations += len(orders)
-	}
-
-	totalCancellations := 0
-	for _, orders := range canceled {
-		totalCancellations += len(orders)
-	}
-
-	nonCanceledCount := 0
-	for email, confirmedOrders := range confirmed {
-		for orderID := range confirmedOrders {
-			if canceledOrders, exists := canceled[email]; !exists || !canceledOrders[orderID] {
-				nonCanceledCount++
-			}
-		}
-	}
-
-	writer.Write([]string{"Total Confirmations", fmt.Sprintf("%d", totalConfirmations)})
-	writer.Write([]string{"Total Cancellations", fmt.Sprintf("%d", totalCancellations)})
-	writer.Write([]string{"Total Non-Cancelled Orders", fmt.Sprintf("%d", nonCanceledCount)})
-	writer.Write([]string{""})
+	writer.Write([]string{"Total Confirmations", fmt.Sprintf("%d", overall.TotalConfirmations)})
+	writer.Write([]string{"Total Cancellations", fmt.Sprintf("%d", overall.TotalCancellations)})
+	writer.Write([]string{"Total Non-Cancelled Orders", fmt.Sprintf("%d", overall.TotalNonCancelled)})
+	writer.Write([]string{"Total Shipped Orders", fmt.Sprintf("%d", overall.TotalShipped)})
 }
 
-func writeProductStats(writer *csv.Writer, stats map[string]struct{ Confirmed, NonCanceled int }) {
+func writeProductStatsCSV(writer *csv.Writer, productStats []ProductStatData) {
+	writer.Write([]string{""})
 	writer.Write([]string{"Per-Product Stats"})
-	writer.Write([]string{"Product", "Total Confirmed", "Non-Cancelled", "Stick Rate (%)"})
-
-	type productEntry struct {
-		name        string
-		confirmed   int
-		nonCanceled int
-	}
-
-	var products []productEntry
-	for name, stat := range stats {
-		products = append(products, productEntry{
-			name:        name,
-			confirmed:   stat.Confirmed,
-			nonCanceled: stat.NonCanceled,
-		})
-	}
-
-	sort.Slice(products, func(i, j int) bool {
-		return products[i].nonCanceled > products[j].nonCanceled
-	})
-
-	for _, p := range products {
-		stickRate := 0.0
-		if p.confirmed > 0 {
-			stickRate = float64(p.nonCanceled) / float64(p.confirmed) * 100
-		}
-
+	writer.Write([]string{"Product", "Total Confirmed", "Non-Cancelled", "Shipped", "Stick Rate (%)"})
+	for _, p := range productStats {
 		writer.Write([]string{
-			p.name,
-			fmt.Sprintf("%d", p.confirmed),
-			fmt.Sprintf("%d", p.nonCanceled),
-			fmt.Sprintf("%.2f", stickRate),
+			p.Name,
+			fmt.Sprintf("%d", p.Confirmed),
+			fmt.Sprintf("%d", p.NonCanceled),
+			fmt.Sprintf("%d", p.Shipped),
+			fmt.Sprintf("%.2f", p.StickRate),
 		})
 	}
-
 	writer.Write([]string{""})
 }
 
-func writeEmailStats(writer *csv.Writer, confirmed map[string]map[string]string, canceled map[string]map[string]bool) {
+func writeShippedOrdersListCSV(writer *csv.Writer, shippedOrders []ShippedOrderData) {
+	writer.Write([]string{""})
+	writer.Write([]string{"Shipped Orders Details"})
+	writer.Write([]string{"Email", "Order ID", "Product Name", "Tracking Number"})
+	for _, entry := range shippedOrders {
+		writer.Write([]string{entry.Email, entry.OrderID, entry.ProductName, entry.TrackingNumber})
+	}
+	writer.Write([]string{""})
+}
+
+func writePendingShipmentOrdersCSV(writer *csv.Writer, pendingOrders []PendingShipmentData) {
+	writer.Write([]string{""})
+	writer.Write([]string{"Confirmed Orders - Pending Shipment (Not Canceled)"})
+	writer.Write([]string{"Email", "Order ID", "Product Name"})
+	for _, entry := range pendingOrders {
+		writer.Write([]string{entry.Email, entry.OrderID, entry.ProductName})
+	}
+	writer.Write([]string{""})
+}
+
+func writeEmailStatsCSV(writer *csv.Writer, emailStats EmailStatsDataContainer) {
+	writer.Write([]string{""})
 	writer.Write([]string{"Per-Email Account Stats"})
 
-	allEmails := make(map[string]bool)
-	for email := range confirmed {
-		allEmails[email] = true
-	}
-	for email := range canceled {
-		allEmails[email] = true
-	}
-
-	type emailStat struct {
-		email              string
-		nonCanceled        int
-		totalCancellations int
-	}
-
-	var stats []emailStat
-	for email := range allEmails {
-		stat := emailStat{email: email}
-
-		if confirmedOrders, exists := confirmed[email]; exists {
-			for orderID := range confirmedOrders {
-				isCanceled := false
-				if canceledOrders, exists := canceled[email]; exists && canceledOrders[orderID] {
-					isCanceled = true
-				}
-
-				if !isCanceled {
-					stat.nonCanceled++
-				}
-			}
-		}
-
-		if canceledOrders, exists := canceled[email]; exists {
-			stat.totalCancellations = len(canceledOrders)
-		}
-
-		stats = append(stats, stat)
-	}
-
-	writer.Write([]string{"Accounts with Most Non-Cancelled Orders (Sticks)"})
+	writer.Write([]string{""})
+	writer.Write([]string{"Top Accounts by Non-Cancelled Orders"})
 	writer.Write([]string{"Email Address", "Non-Cancelled Orders", "Total Cancellations"})
-
-	sort.Slice(stats, func(i, j int) bool {
-		return stats[i].nonCanceled > stats[j].nonCanceled
-	})
-
-	for _, stat := range stats {
-		if stat.nonCanceled > 0 {
-			writer.Write([]string{
-				stat.email,
-				fmt.Sprintf("%d", stat.nonCanceled),
-				fmt.Sprintf("%d", stat.totalCancellations),
-			})
-		}
+	for _, stat := range emailStats.TopNonCancelled {
+		writer.Write([]string{
+			stat.Email,
+			fmt.Sprintf("%d", stat.NonCanceled),
+			fmt.Sprintf("%d", stat.TotalCancellations),
+		})
 	}
 	writer.Write([]string{""})
 
-	writer.Write([]string{"Accounts with Cancellations and No Non-Cancelled Orders"})
+	writer.Write([]string{""})
+	writer.Write([]string{"Accounts with Only Cancellations (No Non-Cancelled Orders)"})
 	writer.Write([]string{"Email Address", "Total Cancellations", "Non-Cancelled Orders"})
-
-	for _, stat := range stats {
-		if stat.totalCancellations > 0 && stat.nonCanceled == 0 {
-			writer.Write([]string{
-				stat.email,
-				fmt.Sprintf("%d", stat.totalCancellations),
-				"0",
-			})
-		}
+	for _, stat := range emailStats.OnlyCancellations {
+		writer.Write([]string{
+			stat.Email,
+			fmt.Sprintf("%d", stat.TotalCancellations),
+			"0", // By definition, NonCanceled is 0 for this list
+		})
 	}
 	writer.Write([]string{""})
+}
+
+func writeHTMLReport(data ReportData) {
+	tmpl, err := template.ParseFiles("report_template.html")
+	if err != nil {
+		log.Fatalf("Failed to parse HTML template: %v", err)
+	}
+
+	timestamp := time.Now().Format("20060102_150405")
+	filename := fmt.Sprintf("%s_%s.html", htmlFileBaseName, timestamp)
+	file, err := os.Create(filename)
+	if err != nil {
+		log.Fatalf("Failed to create HTML report file: %v", err)
+	}
+	defer file.Close()
+
+	err = tmpl.Execute(file, data)
+	if err != nil {
+		log.Fatalf("Failed to execute HTML template: %v", err)
+	}
+	log.Printf("HTML report written to %s", filename)
 }
