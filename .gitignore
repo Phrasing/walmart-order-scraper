@@ -1,0 +1,51 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+walmart-order-scraper
+
+# Test binaries
+*.test
+
+# Output files
+*.out
+
+# Dependency directories (if not committed intentionally)
+# vendor/
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDE / Editor specific
+.idea/
+.vscode/
+*.swp
+*~
+*.sublime-project
+*.sublime-workspace
+
+# Log files
+*.log
+
+# Temporary files
+*.tmp
+
+# Coverage profil
+coverage.out
+profile.out
+
+# Sensitive files
+token.json
+credentials.json
+client_secret_*.json
+
+# CSV files
+*.csv
