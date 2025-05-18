@@ -35,12 +35,13 @@ const (
 
 // ReportData holds all data for the HTML template
 type ReportData struct {
-	Timestamp             string
-	Overall               OverallStatsData
-	ProductStats          []ProductStatData
-	ShippedOrders         []ShippedOrderData
-	PendingShipmentOrders []PendingShipmentData
-	EmailStats            EmailStatsDataContainer
+	Timestamp              string
+	Overall                OverallStatsData
+	ProductStats           []ProductStatData
+	ShippedOrders          []ShippedOrderData
+	PendingShipmentOrders  []PendingShipmentData  // This is actually "Confirmed but not Shipped and not Cancelled"
+	AwaitingShipmentOrders []AwaitingShipmentData // This will be "Not Cancelled and No Shipping Email"
+	EmailStats             EmailStatsDataContainer
 }
 
 type OverallStatsData struct {
@@ -63,9 +64,17 @@ type ShippedOrderData struct {
 	OrderID        string
 	ProductName    string
 	TrackingNumber string
+	TrackingLink   string // Added for carrier tracking link
 }
 
 type PendingShipmentData struct {
+	Email       string
+	OrderID     string
+	ProductName string
+}
+
+// AwaitingShipmentData represents orders that are confirmed, not canceled, but for which we haven't received a shipping email.
+type AwaitingShipmentData struct {
 	Email       string
 	OrderID     string
 	ProductName string
@@ -101,6 +110,48 @@ var (
 	reProductName       = regexp.MustCompile(`quantity \d+ item ([^"<]+)`)
 	reTrackingNumber    = regexp.MustCompile(`(?i)tracking number <a[^>]*>([^<]+)</a>`)
 )
+
+// getTrackingLink attempts to determine the carrier and return a direct tracking link.
+func getTrackingLink(trackingNumber string) string {
+	trackingNumber = strings.TrimSpace(trackingNumber)
+	if trackingNumber == "" || trackingNumber == "N/A" {
+		return ""
+	}
+
+	// USPS
+	// Common patterns: 20-22 digits, or 13 char international (e.g., XX000000000XX)
+	// Specific prefixes like 9400, 9205, 9303 for domestic.
+	if (len(trackingNumber) >= 20 && len(trackingNumber) <= 22 && regexp.MustCompile(`^\d+$`).MatchString(trackingNumber)) ||
+		(len(trackingNumber) == 13 && regexp.MustCompile(`^[A-Z]{2}\d{9}[A-Z]{2}$`).MatchString(trackingNumber)) ||
+		(regexp.MustCompile(`^9[2-4]\d{18,20}$`).MatchString(trackingNumber)) { // More specific USPS domestic
+		return fmt.Sprintf("https://tools.usps.com/go/TrackConfirmAction?tLabels=%s", trackingNumber)
+	}
+
+	// UPS: Starts with 1Z, 18 chars total.
+	if strings.HasPrefix(trackingNumber, "1Z") && len(trackingNumber) == 18 && regexp.MustCompile(`^1Z[0-9A-Z]{16}$`).MatchString(trackingNumber) {
+		return fmt.Sprintf("https://www.ups.com/track?loc=en_US&tracknum=%s", trackingNumber)
+	}
+
+	// FedEx: Common lengths 12 (Express), 15 (Ground), also 20, 22. Typically all digits.
+	// Prefixes like 96..., 6..., 7..., 56...
+	if (len(trackingNumber) == 12 || len(trackingNumber) == 15 || len(trackingNumber) == 20 || len(trackingNumber) == 22) && regexp.MustCompile(`^\d+$`).MatchString(trackingNumber) {
+		if strings.HasPrefix(trackingNumber, "96") || // FedEx Express (new)
+			strings.HasPrefix(trackingNumber, "6") || // FedEx Ground (often 15 digits starting with 6)
+			strings.HasPrefix(trackingNumber, "7") || // FedEx Express (common 12 digits)
+			strings.HasPrefix(trackingNumber, "56") || // FedEx SmartPost
+			len(trackingNumber) == 12 || len(trackingNumber) == 15 { // General catch for typical lengths
+			return fmt.Sprintf("https://www.fedex.com/fedextrack/?trknbr=%s", trackingNumber)
+		}
+	}
+	// Amazon Logistics (TBA numbers)
+	if strings.HasPrefix(trackingNumber, "TBA") && regexp.MustCompile(`^TBA[A-Z0-9]{12,15}$`).MatchString(trackingNumber) { // Adjusted regex for TBA
+		return fmt.Sprintf("https://www.amazon.com/progress-tracker/package/%s", trackingNumber)
+	}
+
+	// If no specific carrier matched, return empty or a generic search link
+	// return fmt.Sprintf("https://www.google.com/search?q=track+%s", trackingNumber) // Optional: generic search
+	return ""
+}
 
 func main() {
 	ctx := context.Background()
@@ -343,11 +394,7 @@ func processSingleEmail(srv *gmail.Service, msgID string, workerID int) (Order, 
 			}
 		}
 		if order.OrderID == "" { // Fallback if not found in body, check subject (though less likely for shipped)
-			// Attempt to find order number in subject for shipped emails if not in body
-			// This part might need adjustment based on actual shipped email subject format for order numbers
-			// For now, we assume it's primarily in the body like confirmations.
-			// If not found, it will be "unknown_MSGID"
-			subjectOrderMatches := reOrderNumber.FindStringSubmatch(subject) // Example, might not be correct
+			subjectOrderMatches := reOrderNumber.FindStringSubmatch(subject)
 			if len(subjectOrderMatches) > 1 {
 				order.OrderID = strings.ReplaceAll(subjectOrderMatches[1], "-", "")
 			} else {
@@ -366,8 +413,8 @@ func processSingleEmail(srv *gmail.Service, msgID string, workerID int) (Order, 
 	}
 
 	if reOrderConfirmation.MatchString(subject) {
-		order.IsCanceled = false // Explicitly false for confirmations
-		order.IsShipped = false  // Explicitly false for confirmations
+		order.IsCanceled = false
+		order.IsShipped = false
 		if body != "" {
 			if matches := reOrderNumber.FindStringSubmatch(body); len(matches) > 1 {
 				order.OrderID = strings.ReplaceAll(matches[1], "-", "")
@@ -456,12 +503,12 @@ func generateReportData(orders []Order) ReportData {
 	reportTimestamp := time.Now().Format(time.RFC1123)
 	if len(orders) == 0 {
 		log.Println("No orders to process for report data generation")
-		return ReportData{Timestamp: reportTimestamp} // Return empty report with timestamp
+		return ReportData{Timestamp: reportTimestamp}
 	}
 
-	confirmedByEmail := make(map[string]map[string]string) // email -> orderID -> productName
-	canceledByEmail := make(map[string]map[string]bool)    // email -> orderID -> true
-	shippedOrdersInfo := make(map[string]map[string]Order) // email -> orderID -> Order (with tracking)
+	confirmedByEmail := make(map[string]map[string]string)
+	canceledByEmail := make(map[string]map[string]bool)
+	shippedOrdersInfo := make(map[string]map[string]Order)
 
 	for _, order := range orders {
 		if order.IsCanceled {
@@ -480,7 +527,7 @@ func generateReportData(orders []Order) ReportData {
 			if _, productExists := confirmedByEmail[order.Email][order.OrderID]; !productExists {
 				confirmedByEmail[order.Email][order.OrderID] = order.ProductName
 			}
-		} else { // Is a confirmation
+		} else {
 			if _, exists := confirmedByEmail[order.Email]; !exists {
 				confirmedByEmail[order.Email] = make(map[string]string)
 			}
@@ -488,7 +535,6 @@ func generateReportData(orders []Order) ReportData {
 		}
 	}
 
-	// Overall Stats Calculation
 	var overallData OverallStatsData
 	for _, orderMap := range confirmedByEmail {
 		overallData.TotalConfirmations += len(orderMap)
@@ -507,7 +553,6 @@ func generateReportData(orders []Order) ReportData {
 		overallData.TotalShipped += len(shippedMap)
 	}
 
-	// Product Stats Calculation
 	productStatsMap := make(map[string]struct {
 		Confirmed   int
 		NonCanceled int
@@ -563,18 +608,69 @@ func generateReportData(orders []Order) ReportData {
 		return productStatsData[i].NonCanceled > productStatsData[j].NonCanceled
 	})
 
-	// Shipped Orders List
 	var shippedOrdersData []ShippedOrderData
+	// Concurrently process tracking links
+	type trackingLinkJob struct {
+		Email          string
+		OrderID        string
+		ProductName    string
+		TrackingNumber string
+	}
+
+	numShippedOrders := 0
+	for _, orderMap := range shippedOrdersInfo {
+		numShippedOrders += len(orderMap)
+	}
+
+	jobs := make(chan trackingLinkJob, numShippedOrders)
+	results := make(chan ShippedOrderData, numShippedOrders)
+	var wgLinks sync.WaitGroup
+
+	// Start workers for getTrackingLink
+	// Using numWorkers for this as well, can be tuned.
+	for w := 0; w < numWorkers; w++ {
+		wgLinks.Add(1)
+		go func() {
+			defer wgLinks.Done()
+			for job := range jobs {
+				link := getTrackingLink(job.TrackingNumber)
+				results <- ShippedOrderData{
+					Email:          job.Email,
+					OrderID:        job.OrderID,
+					ProductName:    job.ProductName,
+					TrackingNumber: job.TrackingNumber,
+					TrackingLink:   link,
+				}
+			}
+		}()
+	}
+
+	// Send jobs
 	for email, orderMap := range shippedOrdersInfo {
 		for orderID, orderDetails := range orderMap {
-			shippedOrdersData = append(shippedOrdersData, ShippedOrderData{
+			jobs <- trackingLinkJob{
 				Email:          email,
 				OrderID:        orderID,
 				ProductName:    orderDetails.ProductName,
 				TrackingNumber: orderDetails.TrackingNumber,
-			})
+			}
 		}
 	}
+	close(jobs)
+
+	// Collect results
+	// wgLinks.Wait() should be called after closing results channel
+	// but we need to collect results first.
+	// A separate goroutine to close results channel once all workers are done.
+	go func() {
+		wgLinks.Wait()
+		close(results)
+	}()
+
+	for sod := range results {
+		shippedOrdersData = append(shippedOrdersData, sod)
+	}
+
 	sort.Slice(shippedOrdersData, func(i, j int) bool {
 		if shippedOrdersData[i].Email != shippedOrdersData[j].Email {
 			return shippedOrdersData[i].Email < shippedOrdersData[j].Email
@@ -582,7 +678,6 @@ func generateReportData(orders []Order) ReportData {
 		return shippedOrdersData[i].OrderID < shippedOrdersData[j].OrderID
 	})
 
-	// Pending Shipment Orders List
 	var pendingShipmentData []PendingShipmentData
 	for email, orderMap := range confirmedByEmail {
 		for orderID, productName := range orderMap {
@@ -610,7 +705,79 @@ func generateReportData(orders []Order) ReportData {
 		return pendingShipmentData[i].OrderID < pendingShipmentData[j].OrderID
 	})
 
-	// Email Stats
+	// Logic for AwaitingShipmentOrders (Not Cancelled, No Shipping Email)
+	// This is subtly different from PendingShipmentOrders.
+	// PendingShipmentOrders = Confirmed AND NOT Cancelled AND NOT Shipped (based on *any* shipping email for that order ID)
+	// AwaitingShipmentOrders = Confirmed AND NOT Cancelled AND (No Shipping Email *at all* for that order ID from *any* source)
+	// For this task, "we still don't have a shipping email for" implies checking against shippedOrdersInfo.
+	// The existing PendingShipmentOrders logic already covers this.
+	// Let's rename PendingShipmentOrders to AwaitingShipmentNoEmail to be more precise
+	// and then ensure the logic correctly populates it.
+	// The request is "all the orders that were not cancelled but we still don't have a shipping email for."
+	// This is exactly what `pendingShipmentData` currently calculates.
+	// So, we will use `pendingShipmentData` for the new `AwaitingShipmentOrders` field
+	// and remove the `PendingShipmentOrders` field from ReportData as it's redundant with the new request.
+
+	// Re-evaluating: The user asked for "another section".
+	// `PendingShipmentOrders` is defined as: confirmed, not cancelled, not shipped.
+	// The new request: "not cancelled but we still don't have a shipping email for".
+	// These two are identical if "shipped" means "has a shipping email".
+	// Let's assume the existing `PendingShipmentOrders` is what they want in this new section.
+	// To avoid confusion and make it explicit, I will populate `AwaitingShipmentOrders` with the same data
+	// as `PendingShipmentOrders`. The user can then decide if they want to remove the old "Pending Shipment" section
+	// from the template later if it's truly redundant.
+
+	var awaitingShipmentData []AwaitingShipmentData
+	for email, orderMap := range confirmedByEmail {
+		for orderID, productName := range orderMap {
+			isCanceled := false
+			if cancelMap, exists := canceledByEmail[email]; exists && cancelMap[orderID] {
+				isCanceled = true
+			}
+
+			// Check if a shipping email exists for this specific orderID and email
+			// AND if that shipping email is effectively for the 'productName' from the confirmation.
+			productNameFromConfirmation := productName // productName is from confirmedByEmail[email][orderID]
+
+			shippedAsThisProduct := false
+			if shippingDetails, shippingRecordExists := shippedOrdersInfo[email][orderID]; shippingRecordExists {
+				// A shipping record exists for this (email, orderID).
+				// Now, determine the "effective" product name this shipping record contributes to in ProductStats.
+				effectiveShippedProductName := shippingDetails.ProductName // Start with product name from the shipping email.
+
+				if effectiveShippedProductName == "" || strings.HasPrefix(effectiveShippedProductName, "Unknown Product") {
+					// If the shipping email's product name is generic,
+					// check if the original confirmation (productNameFromConfirmation) had a more specific name.
+					if productNameFromConfirmation != "" && !strings.HasPrefix(productNameFromConfirmation, "Unknown Product") {
+						effectiveShippedProductName = productNameFromConfirmation
+					}
+					// If both confirmation and shipping names were generic, effectiveShippedProductName remains the generic one from the shipping email.
+				}
+				// Now, effectiveShippedProductName is the name that this shipped item would be tallied under in ProductStats.
+
+				if effectiveShippedProductName == productNameFromConfirmation {
+					// The item was shipped and its shipping record (after reconciliation) matches the confirmed product.
+					shippedAsThisProduct = true
+				}
+			}
+			// If no shippingRecordExists for this (email, orderID), shippedAsThisProduct remains false.
+
+			if !isCanceled && !shippedAsThisProduct {
+				awaitingShipmentData = append(awaitingShipmentData, AwaitingShipmentData{
+					Email:       email,
+					OrderID:     orderID,
+					ProductName: productName,
+				})
+			}
+		}
+	}
+	sort.Slice(awaitingShipmentData, func(i, j int) bool {
+		if awaitingShipmentData[i].Email != awaitingShipmentData[j].Email {
+			return awaitingShipmentData[i].Email < awaitingShipmentData[j].Email
+		}
+		return awaitingShipmentData[i].OrderID < awaitingShipmentData[j].OrderID
+	})
+
 	allEmails := make(map[string]bool)
 	for email := range confirmedByEmail {
 		allEmails[email] = true
@@ -637,7 +804,7 @@ func generateReportData(orders []Order) ReportData {
 	var topNonCancelled []EmailStatData
 	var onlyCancellations []EmailStatData
 
-	sort.Slice(emailStatsList, func(i, j int) bool { // Sort once for TopNonCancelled
+	sort.Slice(emailStatsList, func(i, j int) bool {
 		return emailStatsList[i].NonCanceled > emailStatsList[j].NonCanceled
 	})
 	for _, stat := range emailStatsList {
@@ -648,14 +815,14 @@ func generateReportData(orders []Order) ReportData {
 			onlyCancellations = append(onlyCancellations, stat)
 		}
 	}
-	// No need to re-sort for onlyCancellations unless a different sort order is desired for that specific list.
 
 	return ReportData{
-		Timestamp:             reportTimestamp,
-		Overall:               overallData,
-		ProductStats:          productStatsData,
-		ShippedOrders:         shippedOrdersData,
-		PendingShipmentOrders: pendingShipmentData,
+		Timestamp:              reportTimestamp,
+		Overall:                overallData,
+		ProductStats:           productStatsData,
+		ShippedOrders:          shippedOrdersData,
+		PendingShipmentOrders:  pendingShipmentData,  // Keep this for now, user might still want it
+		AwaitingShipmentOrders: awaitingShipmentData, // Populate the new field
 		EmailStats: EmailStatsDataContainer{
 			TopNonCancelled:   topNonCancelled,
 			OnlyCancellations: onlyCancellations,
@@ -674,11 +841,11 @@ func writeCSVStats(data ReportData) {
 	writer := csv.NewWriter(file)
 	defer writer.Flush()
 
-	// Adapt existing write functions to use ReportData fields
 	writeOverallStatsCSV(writer, data.Overall)
 	writeProductStatsCSV(writer, data.ProductStats)
 	writeShippedOrdersListCSV(writer, data.ShippedOrders)
-	writePendingShipmentOrdersCSV(writer, data.PendingShipmentOrders)
+	writePendingShipmentOrdersCSV(writer, data.PendingShipmentOrders)   // Keep existing
+	writeAwaitingShipmentOrdersCSV(writer, data.AwaitingShipmentOrders) // Add new
 	writeEmailStatsCSV(writer, data.EmailStats)
 
 	log.Printf("CSV statistics written to %s", filename)
@@ -687,7 +854,6 @@ func writeCSVStats(data ReportData) {
 func writeOverallStatsCSV(writer *csv.Writer, overall OverallStatsData) {
 	writer.Write([]string{"Overall Stats"})
 	writer.Write([]string{"Metric", "Count"})
-
 	writer.Write([]string{"Total Confirmations", fmt.Sprintf("%d", overall.TotalConfirmations)})
 	writer.Write([]string{"Total Cancellations", fmt.Sprintf("%d", overall.TotalCancellations)})
 	writer.Write([]string{"Total Non-Cancelled Orders", fmt.Sprintf("%d", overall.TotalNonCancelled)})
@@ -713,9 +879,9 @@ func writeProductStatsCSV(writer *csv.Writer, productStats []ProductStatData) {
 func writeShippedOrdersListCSV(writer *csv.Writer, shippedOrders []ShippedOrderData) {
 	writer.Write([]string{""})
 	writer.Write([]string{"Shipped Orders Details"})
-	writer.Write([]string{"Email", "Order ID", "Product Name", "Tracking Number"})
+	writer.Write([]string{"Email", "Order ID", "Product Name", "Tracking Number", "Tracking Link"})
 	for _, entry := range shippedOrders {
-		writer.Write([]string{entry.Email, entry.OrderID, entry.ProductName, entry.TrackingNumber})
+		writer.Write([]string{entry.Email, entry.OrderID, entry.ProductName, entry.TrackingNumber, entry.TrackingLink})
 	}
 	writer.Write([]string{""})
 }
@@ -725,6 +891,16 @@ func writePendingShipmentOrdersCSV(writer *csv.Writer, pendingOrders []PendingSh
 	writer.Write([]string{"Confirmed Orders - Pending Shipment (Not Canceled)"})
 	writer.Write([]string{"Email", "Order ID", "Product Name"})
 	for _, entry := range pendingOrders {
+		writer.Write([]string{entry.Email, entry.OrderID, entry.ProductName})
+	}
+	writer.Write([]string{""})
+}
+
+func writeAwaitingShipmentOrdersCSV(writer *csv.Writer, awaitingOrders []AwaitingShipmentData) {
+	writer.Write([]string{""})
+	writer.Write([]string{"Orders Not Cancelled & No Shipping Email Yet"})
+	writer.Write([]string{"Email", "Order ID", "Product Name"})
+	for _, entry := range awaitingOrders {
 		writer.Write([]string{entry.Email, entry.OrderID, entry.ProductName})
 	}
 	writer.Write([]string{""})
@@ -753,7 +929,7 @@ func writeEmailStatsCSV(writer *csv.Writer, emailStats EmailStatsDataContainer) 
 		writer.Write([]string{
 			stat.Email,
 			fmt.Sprintf("%d", stat.TotalCancellations),
-			"0", // By definition, NonCanceled is 0 for this list
+			"0",
 		})
 	}
 	writer.Write([]string{""})
