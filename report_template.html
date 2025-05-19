@@ -74,6 +74,7 @@
                     <th>Order ID</th>
                     <th>Product Name</th>
                     <th>Tracking Number</th>
+                    <th>Shipment Status</th>
                 </tr>
             </thead>
             <tbody>
@@ -89,10 +90,11 @@
                             {{.TrackingNumber}}
                         {{end}}
                     </td>
+                    <td>{{.ShipmentStatus}}</td>
                 </tr>
                 {{end}}
                  {{if not .ShippedOrders}}
-                <tr><td colspan="4">No shipped orders found.</td></tr>
+                <tr><td colspan="5">No shipped orders found.</td></tr>
                 {{end}}
             </tbody>
         </table>
