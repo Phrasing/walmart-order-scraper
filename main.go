@@ -1,14 +1,20 @@
 package main
 
 import (
+	"bytes" // Added for HTTP request body
 	"context"
 	"encoding/base64"
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"html/template"
+	"io" // Added for reading HTTP response
 	"log"
+	"net/http" // Added for direct API calls
+	"net/url"  // Added for OAuth token request
 	"os"
+
+	// "os/exec" // No longer needed for MCP tool
 	"regexp"
 	"sort"
 	"strings"
@@ -22,28 +28,32 @@ import (
 )
 
 const (
-	tokenFile        = "token.json"
-	credentialsFile  = "credentials.json"
-	emailQuery       = "from:help@walmart.com newer_than:30d"
-	numWorkers       = 3
-	maxRetryAttempts = 3
-	baseRetrySleep   = time.Second
-	apiRateDelayMs   = 50
-	csvFileBaseName  = "walmart_order_stats"
-	htmlFileBaseName = "walmart_order_report"
+	tokenFile             = "token.json"
+	credentialsFile       = "credentials.json"
+	emailQuery            = "from:help@walmart.com newer_than:30d"
+	numWorkers            = 3
+	maxRetryAttempts      = 3
+	baseRetrySleep        = time.Second
+	apiRateDelayMs        = 50
+	csvFileBaseName       = "walmart_order_stats"
+	htmlFileBaseName      = "walmart_order_report"
+	fedexTokenURL         = "https://apis.fedex.com/oauth/token"
+	fedexTrackingURL      = "https://apis.fedex.com/track/v1/trackingnumbers"
+	shipmentDetailWorkers = 1 // Keep at 1 for now, can be tuned later
 )
 
-// ReportData holds all data for the HTML template
+// ReportData (remains the same)
 type ReportData struct {
 	Timestamp              string
 	Overall                OverallStatsData
 	ProductStats           []ProductStatData
 	ShippedOrders          []ShippedOrderData
-	PendingShipmentOrders  []PendingShipmentData  // This is actually "Confirmed but not Shipped and not Cancelled"
-	AwaitingShipmentOrders []AwaitingShipmentData // This will be "Not Cancelled and No Shipping Email"
+	PendingShipmentOrders  []PendingShipmentData
+	AwaitingShipmentOrders []AwaitingShipmentData
 	EmailStats             EmailStatsDataContainer
 }
 
+// OverallStatsData (remains the same)
 type OverallStatsData struct {
 	TotalConfirmations int
 	TotalCancellations int
@@ -51,6 +61,7 @@ type OverallStatsData struct {
 	TotalShipped       int
 }
 
+// ProductStatData (remains the same)
 type ProductStatData struct {
 	Name        string
 	Confirmed   int
@@ -59,38 +70,44 @@ type ProductStatData struct {
 	StickRate   float64
 }
 
+// ShippedOrderData (ShipmentStatus field was already added)
 type ShippedOrderData struct {
 	Email          string
 	OrderID        string
 	ProductName    string
 	TrackingNumber string
-	TrackingLink   string // Added for carrier tracking link
+	TrackingLink   string
+	ShipmentStatus string
 }
 
+// PendingShipmentData (remains the same)
 type PendingShipmentData struct {
 	Email       string
 	OrderID     string
 	ProductName string
 }
 
-// AwaitingShipmentData represents orders that are confirmed, not canceled, but for which we haven't received a shipping email.
+// AwaitingShipmentData (remains the same)
 type AwaitingShipmentData struct {
 	Email       string
 	OrderID     string
 	ProductName string
 }
 
+// EmailStatData (remains the same)
 type EmailStatData struct {
 	Email              string
 	NonCanceled        int
 	TotalCancellations int
 }
 
+// EmailStatsDataContainer (remains the same)
 type EmailStatsDataContainer struct {
 	TopNonCancelled   []EmailStatData
 	OnlyCancellations []EmailStatData
 }
 
+// Order (remains the same)
 type Order struct {
 	MsgID          string
 	Email          string
@@ -102,6 +119,39 @@ type Order struct {
 	Subject        string
 }
 
+// Struct for FedEx OAuth Token Response
+type FedexOauthTokenResponse struct {
+	AccessToken string `json:"access_token"`
+	TokenType   string `json:"token_type"`
+	ExpiresIn   int    `json:"expires_in"` // Typically in seconds
+	Scope       string `json:"scope"`
+}
+
+// Structs for parsing FedEx Tracking API JSON output (adapted from FedexMcpResponse)
+type FedexTrackingApiResponse struct {
+	TransactionID string `json:"transactionId"`
+	Output        struct {
+		CompleteTrackResults []struct {
+			TrackResults []struct {
+				LatestStatusDetail struct {
+					StatusByLocale string `json:"statusByLocale"`
+					DerivedStatus  string `json:"derivedStatus"`
+					Description    string `json:"description"`
+				} `json:"latestStatusDetail"`
+				// We might need more fields later, but this is enough for status
+			} `json:"trackResults"`
+		} `json:"completeTrackResults"`
+		Alerts []struct { // To capture API-level alerts/errors from FedEx
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"alerts"`
+	} `json:"output"`
+	Errors []struct { // To capture top-level errors (e.g., auth errors if token is bad)
+		Code    string `json:"code"`
+		Message string `json:"message"`
+	} `json:"errors"`
+}
+
 var (
 	reOrderConfirmation = regexp.MustCompile(`(?i)thanks for your order|order confirmation`)
 	reOrderCancellation = regexp.MustCompile(`(?i)Canceled:.*?order #([\d-]+)|your order.*?has been canceled`)
@@ -111,50 +161,181 @@ var (
 	reTrackingNumber    = regexp.MustCompile(`(?i)tracking number <a[^>]*>([^<]+)</a>`)
 )
 
-// getTrackingLink attempts to determine the carrier and return a direct tracking link.
+func isFedexTrackingNumber(trackingNumber string) bool {
+	trackingNumber = strings.TrimSpace(trackingNumber)
+	if (len(trackingNumber) == 12 || len(trackingNumber) == 15 || len(trackingNumber) == 20 || len(trackingNumber) == 22) && regexp.MustCompile(`^\d+$`).MatchString(trackingNumber) {
+		if strings.HasPrefix(trackingNumber, "96") ||
+			strings.HasPrefix(trackingNumber, "6") ||
+			strings.HasPrefix(trackingNumber, "7") ||
+			strings.HasPrefix(trackingNumber, "56") ||
+			len(trackingNumber) == 12 || len(trackingNumber) == 15 {
+			return true
+		}
+	}
+	return false
+}
+
+func getFedexAccessToken(clientID, clientSecret string) (string, error) {
+	data := url.Values{}
+	data.Set("grant_type", "client_credentials")
+	data.Set("client_id", clientID)
+	data.Set("client_secret", clientSecret)
+
+	req, err := http.NewRequest("POST", fedexTokenURL, strings.NewReader(data.Encode()))
+	if err != nil {
+		return "", fmt.Errorf("error creating token request: %w", err)
+	}
+	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("error fetching token: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("error reading token response body: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("fedex token api error: %s - %s", resp.Status, string(body))
+	}
+
+	var tokenResponse FedexOauthTokenResponse
+	if err := json.Unmarshal(body, &tokenResponse); err != nil {
+		return "", fmt.Errorf("error unmarshalling token response: %w. Body: %s", err, string(body))
+	}
+
+	if tokenResponse.AccessToken == "" {
+		return "", fmt.Errorf("received empty access token. Body: %s", string(body))
+	}
+	return tokenResponse.AccessToken, nil
+}
+
+func getFedexShipmentStatus(trackingNumber, accessToken string) string {
+	if !isFedexTrackingNumber(trackingNumber) {
+		return "Non-FedEx / N/A"
+	}
+	if accessToken == "" {
+		return "Auth Error (No Token)"
+	}
+
+	payload := map[string]interface{}{
+		"includeDetailedScans": true,
+		"trackingInfo": []map[string]interface{}{
+			{
+				"trackingNumberInfo": map[string]string{
+					"trackingNumber": trackingNumber,
+				},
+			},
+		},
+	}
+	jsonPayload, err := json.Marshal(payload)
+	if err != nil {
+		log.Printf("Error marshalling FedEx payload for %s: %v", trackingNumber, err)
+		return "Payload Error"
+	}
+
+	req, err := http.NewRequest("POST", fedexTrackingURL, bytes.NewBuffer(jsonPayload))
+	if err != nil {
+		log.Printf("Error creating FedEx tracking request for %s: %v", trackingNumber, err)
+		return "Request Creation Error"
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+
+	client := &http.Client{Timeout: 15 * time.Second} // Increased timeout for API call
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("Error calling FedEx tracking API for %s: %v", trackingNumber, err)
+		return "API Call Error"
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("Error reading FedEx tracking response body for %s: %v", trackingNumber, err)
+		return "Response Read Error"
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("FedEx tracking API error for %s: %s. Body: %s", trackingNumber, resp.Status, string(body))
+		// Try to parse error from body
+		var apiError FedexTrackingApiResponse
+		if json.Unmarshal(body, &apiError) == nil && len(apiError.Errors) > 0 {
+			return fmt.Sprintf("API Error: %s - %s", apiError.Errors[0].Code, apiError.Errors[0].Message)
+		}
+		return fmt.Sprintf("API Error: %s", resp.Status)
+	}
+
+	var trackingResponse FedexTrackingApiResponse
+	if err := json.Unmarshal(body, &trackingResponse); err != nil {
+		log.Printf("Error unmarshalling FedEx tracking response for %s: %v. Raw: %s", trackingNumber, err, string(body))
+		return "Parse Error (API)"
+	}
+
+	if len(trackingResponse.Output.CompleteTrackResults) > 0 &&
+		len(trackingResponse.Output.CompleteTrackResults[0].TrackResults) > 0 {
+		statusDetail := trackingResponse.Output.CompleteTrackResults[0].TrackResults[0].LatestStatusDetail
+		if statusDetail.StatusByLocale != "" {
+			return statusDetail.StatusByLocale
+		}
+		if statusDetail.DerivedStatus != "" {
+			return statusDetail.DerivedStatus
+		}
+		if statusDetail.Description != "" { // Fallback to description
+			return statusDetail.Description
+		}
+	}
+	if len(trackingResponse.Output.Alerts) > 0 { // Check for alerts if no results
+		return fmt.Sprintf("Alert: %s", trackingResponse.Output.Alerts[0].Message)
+	}
+
+	return "Status N/A"
+}
+
 func getTrackingLink(trackingNumber string) string {
+	// (This function remains largely the same, isFedexTrackingNumber is now a separate helper)
 	trackingNumber = strings.TrimSpace(trackingNumber)
 	if trackingNumber == "" || trackingNumber == "N/A" {
 		return ""
 	}
-
-	// USPS
-	// Common patterns: 20-22 digits, or 13 char international (e.g., XX000000000XX)
-	// Specific prefixes like 9400, 9205, 9303 for domestic.
 	if (len(trackingNumber) >= 20 && len(trackingNumber) <= 22 && regexp.MustCompile(`^\d+$`).MatchString(trackingNumber)) ||
 		(len(trackingNumber) == 13 && regexp.MustCompile(`^[A-Z]{2}\d{9}[A-Z]{2}$`).MatchString(trackingNumber)) ||
-		(regexp.MustCompile(`^9[2-4]\d{18,20}$`).MatchString(trackingNumber)) { // More specific USPS domestic
+		(regexp.MustCompile(`^9[2-4]\d{18,20}$`).MatchString(trackingNumber)) {
 		return fmt.Sprintf("https://tools.usps.com/go/TrackConfirmAction?tLabels=%s", trackingNumber)
 	}
-
-	// UPS: Starts with 1Z, 18 chars total.
 	if strings.HasPrefix(trackingNumber, "1Z") && len(trackingNumber) == 18 && regexp.MustCompile(`^1Z[0-9A-Z]{16}$`).MatchString(trackingNumber) {
 		return fmt.Sprintf("https://www.ups.com/track?loc=en_US&tracknum=%s", trackingNumber)
 	}
-
-	// FedEx: Common lengths 12 (Express), 15 (Ground), also 20, 22. Typically all digits.
-	// Prefixes like 96..., 6..., 7..., 56...
-	if (len(trackingNumber) == 12 || len(trackingNumber) == 15 || len(trackingNumber) == 20 || len(trackingNumber) == 22) && regexp.MustCompile(`^\d+$`).MatchString(trackingNumber) {
-		if strings.HasPrefix(trackingNumber, "96") || // FedEx Express (new)
-			strings.HasPrefix(trackingNumber, "6") || // FedEx Ground (often 15 digits starting with 6)
-			strings.HasPrefix(trackingNumber, "7") || // FedEx Express (common 12 digits)
-			strings.HasPrefix(trackingNumber, "56") || // FedEx SmartPost
-			len(trackingNumber) == 12 || len(trackingNumber) == 15 { // General catch for typical lengths
-			return fmt.Sprintf("https://www.fedex.com/fedextrack/?trknbr=%s", trackingNumber)
-		}
+	if isFedexTrackingNumber(trackingNumber) {
+		return fmt.Sprintf("https://www.fedex.com/fedextrack/?trknbr=%s", trackingNumber)
 	}
-	// Amazon Logistics (TBA numbers)
-	if strings.HasPrefix(trackingNumber, "TBA") && regexp.MustCompile(`^TBA[A-Z0-9]{12,15}$`).MatchString(trackingNumber) { // Adjusted regex for TBA
+	if strings.HasPrefix(trackingNumber, "TBA") && regexp.MustCompile(`^TBA[A-Z0-9]{12,15}$`).MatchString(trackingNumber) {
 		return fmt.Sprintf("https://www.amazon.com/progress-tracker/package/%s", trackingNumber)
 	}
-
-	// If no specific carrier matched, return empty or a generic search link
-	// return fmt.Sprintf("https://www.google.com/search?q=track+%s", trackingNumber) // Optional: generic search
 	return ""
 }
 
 func main() {
 	ctx := context.Background()
+
+	fedexClientID := os.Getenv("FEDEX_CLIENT_ID")
+	fedexClientSecret := os.Getenv("FEDEX_CLIENT_SECRET")
+
+	if fedexClientID == "" || fedexClientSecret == "" {
+		log.Fatalf("FEDEX_CLIENT_ID and FEDEX_CLIENT_SECRET environment variables must be set.")
+	}
+
+	log.Println("Fetching FedEx Access Token...")
+	fedexAccessToken, err := getFedexAccessToken(fedexClientID, fedexClientSecret)
+	if err != nil {
+		log.Fatalf("Failed to get FedEx access token: %v", err)
+	}
+	log.Println("Successfully fetched FedEx Access Token.")
+
 	srv := initGmailService(ctx)
 
 	log.Printf("Searching for emails with query: %s\n", emailQuery)
@@ -169,42 +350,38 @@ func main() {
 	orders := processEmails(srv, messageIDs)
 	log.Printf("Processed %d orders from emails\n", len(orders))
 
-	reportData := generateReportData(orders)
-	writeCSVStats(reportData) // Renamed from writeStats
+	reportData := generateReportData(orders, fedexAccessToken) // Pass token
+	writeCSVStats(reportData)
 	writeHTMLReport(reportData)
 }
 
+// Gmail related functions (initGmailService, getToken, etc.) remain unchanged
+// ... (keep existing Gmail functions as they are) ...
 func initGmailService(ctx context.Context) *gmail.Service {
 	tokenPath := os.Getenv("GMAIL_TOKEN_FILE")
 	if tokenPath == "" {
 		tokenPath = tokenFile
 	}
-
 	credsPath := os.Getenv("GMAIL_CREDS_FILE")
 	if credsPath == "" {
 		credsPath = credentialsFile
 	}
-
 	credBytes, err := os.ReadFile(credsPath)
 	if err != nil {
 		log.Fatalf("Unable to read credentials file: %v", err)
 	}
-
 	config, err := google.ConfigFromJSON(credBytes, gmail.GmailReadonlyScope)
 	if err != nil {
 		log.Fatalf("Unable to parse credentials: %v", err)
 	}
-
 	token, err := getToken(config, tokenPath)
 	if err != nil {
 		log.Fatalf("Unable to get authentication token: %v", err)
 	}
-
 	srv, err := gmail.NewService(ctx, option.WithHTTPClient(config.Client(ctx, token)))
 	if err != nil {
 		log.Fatalf("Unable to create Gmail service: %v", err)
 	}
-
 	return srv
 }
 
@@ -213,10 +390,8 @@ func getToken(config *oauth2.Config, tokenPath string) (*oauth2.Token, error) {
 	if err == nil {
 		return token, nil
 	}
-
 	log.Printf("Token file not found or invalid. Getting new token from web.")
 	token = getTokenFromWeb(config)
-
 	saveToken(tokenPath, token)
 	return token, nil
 }
@@ -227,7 +402,6 @@ func readTokenFromFile(file string) (*oauth2.Token, error) {
 		return nil, err
 	}
 	defer f.Close()
-
 	token := &oauth2.Token{}
 	err = json.NewDecoder(f).Decode(token)
 	return token, err
@@ -236,12 +410,10 @@ func readTokenFromFile(file string) (*oauth2.Token, error) {
 func getTokenFromWeb(config *oauth2.Config) *oauth2.Token {
 	authURL := config.AuthCodeURL("state-token", oauth2.AccessTypeOffline)
 	fmt.Printf("Go to this URL in your browser, then enter the code: \n%v\n", authURL)
-
 	var code string
 	if _, err := fmt.Scan(&code); err != nil {
 		log.Fatalf("Unable to read auth code: %v", err)
 	}
-
 	token, err := config.Exchange(context.TODO(), code)
 	if err != nil {
 		log.Fatalf("Unable to get token from web: %v", err)
@@ -256,7 +428,6 @@ func saveToken(path string, token *oauth2.Token) {
 		return
 	}
 	defer f.Close()
-
 	json.NewEncoder(f).Encode(token)
 	log.Printf("Token saved to: %s", path)
 }
@@ -264,30 +435,24 @@ func saveToken(path string, token *oauth2.Token) {
 func searchEmails(srv *gmail.Service) []string {
 	var messageIDs []string
 	pageToken := ""
-
 	for {
 		req := srv.Users.Messages.List("me").Q(emailQuery)
 		if pageToken != "" {
 			req.PageToken(pageToken)
 		}
-
 		res, err := req.Do()
 		if err != nil {
 			log.Fatalf("Failed to search emails: %v", err)
 		}
-
 		for _, msg := range res.Messages {
 			messageIDs = append(messageIDs, msg.Id)
 		}
-
 		if res.NextPageToken == "" {
 			break
 		}
-
 		pageToken = res.NextPageToken
 		time.Sleep(apiRateDelayMs * time.Millisecond)
 	}
-
 	return messageIDs
 }
 
@@ -295,18 +460,15 @@ func processEmails(srv *gmail.Service, messageIDs []string) []Order {
 	var orders []Order
 	var mu sync.Mutex
 	var wg sync.WaitGroup
-
 	idChan := make(chan string, len(messageIDs))
 	for _, id := range messageIDs {
 		idChan <- id
 	}
 	close(idChan)
-
 	for i := 0; i < numWorkers; i++ {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
-
 			for id := range idChan {
 				order, ok := processSingleEmail(srv, id, workerID)
 				if ok {
@@ -317,7 +479,6 @@ func processEmails(srv *gmail.Service, messageIDs []string) []Order {
 			}
 		}(i)
 	}
-
 	wg.Wait()
 	return orders
 }
@@ -325,32 +486,23 @@ func processEmails(srv *gmail.Service, messageIDs []string) []Order {
 func processSingleEmail(srv *gmail.Service, msgID string, workerID int) (Order, bool) {
 	var msg *gmail.Message
 	var err error
-
 	for attempt := 0; attempt < maxRetryAttempts; attempt++ {
 		msg, err = srv.Users.Messages.Get("me", msgID).Format("full").Do()
 		if err == nil {
 			break
 		}
-
-		log.Printf("[Worker %d] Error getting message %s (attempt %d): %v",
-			workerID, msgID, attempt+1, err)
-
-		if strings.Contains(err.Error(), "rateLimitExceeded") ||
-			strings.Contains(err.Error(), "userRateLimitExceeded") ||
-			strings.Contains(err.Error(), "Quota exceeded") {
+		log.Printf("[Worker %d] Error getting message %s (attempt %d): %v", workerID, msgID, attempt+1, err)
+		if strings.Contains(err.Error(), "rateLimitExceeded") || strings.Contains(err.Error(), "userRateLimitExceeded") || strings.Contains(err.Error(), "Quota exceeded") {
 			sleepTime := baseRetrySleep * time.Duration(attempt+1)
 			time.Sleep(sleepTime)
 		} else {
 			return Order{}, false
 		}
 	}
-
 	if err != nil {
-		log.Printf("[Worker %d] Failed to get message %s after %d attempts",
-			workerID, msgID, maxRetryAttempts)
+		log.Printf("[Worker %d] Failed to get message %s after %d attempts", workerID, msgID, maxRetryAttempts)
 		return Order{}, false
 	}
-
 	var subject, recipient string
 	for _, header := range msg.Payload.Headers {
 		if header.Name == "Subject" {
@@ -359,29 +511,19 @@ func processSingleEmail(srv *gmail.Service, msgID string, workerID int) (Order, 
 			recipient = header.Value
 		}
 	}
-
 	recipient = extractEmailAddress(recipient)
 	if recipient == "" {
 		log.Printf("[Worker %d] Could not parse recipient from message %s", workerID, msgID)
 		return Order{}, false
 	}
-
 	body := extractBody(msg.Payload)
-
-	order := Order{
-		MsgID:   msgID,
-		Email:   recipient,
-		Subject: subject,
-	}
-
+	order := Order{MsgID: msgID, Email: recipient, Subject: subject}
 	if matches := reOrderCancellation.FindStringSubmatch(subject); len(matches) > 1 {
 		order.IsCanceled = true
 		order.OrderID = strings.ReplaceAll(matches[1], "-", "")
-		log.Printf("[Worker %d] Found cancellation: Order %s for %s",
-			workerID, order.OrderID, order.Email)
+		log.Printf("[Worker %d] Found cancellation: Order %s for %s", workerID, order.OrderID, order.Email)
 		return order, true
 	}
-
 	if reOrderShipped.MatchString(subject) {
 		order.IsShipped = true
 		if body != "" {
@@ -393,7 +535,7 @@ func processSingleEmail(srv *gmail.Service, msgID string, workerID int) (Order, 
 				order.TrackingNumber = strings.TrimSpace(matches[1])
 			}
 		}
-		if order.OrderID == "" { // Fallback if not found in body, check subject (though less likely for shipped)
+		if order.OrderID == "" {
 			subjectOrderMatches := reOrderNumber.FindStringSubmatch(subject)
 			if len(subjectOrderMatches) > 1 {
 				order.OrderID = strings.ReplaceAll(subjectOrderMatches[1], "-", "")
@@ -407,11 +549,9 @@ func processSingleEmail(srv *gmail.Service, msgID string, workerID int) (Order, 
 		if order.TrackingNumber == "" {
 			order.TrackingNumber = "N/A"
 		}
-		log.Printf("[Worker %d] Found shipment: Order %s, Product '%s', Tracking '%s' for %s",
-			workerID, order.OrderID, order.ProductName, order.TrackingNumber, order.Email)
+		log.Printf("[Worker %d] Found shipment: Order %s, Product '%s', Tracking '%s' for %s", workerID, order.OrderID, order.ProductName, order.TrackingNumber, order.Email)
 		return order, true
 	}
-
 	if reOrderConfirmation.MatchString(subject) {
 		order.IsCanceled = false
 		order.IsShipped = false
@@ -421,18 +561,15 @@ func processSingleEmail(srv *gmail.Service, msgID string, workerID int) (Order, 
 			}
 			order.ProductName = extractProductName(body)
 		}
-
 		if order.OrderID == "" {
 			order.OrderID = "unknown_confirm_" + msgID
 		}
 		if order.ProductName == "" {
 			order.ProductName = "Unknown Product"
 		}
-		log.Printf("[Worker %d] Found confirmation: Order %s, Product '%s' for %s",
-			workerID, order.OrderID, order.ProductName, order.Email)
+		log.Printf("[Worker %d] Found confirmation: Order %s, Product '%s' for %s", workerID, order.OrderID, order.ProductName, order.Email)
 		return order, true
 	}
-
 	return Order{}, false
 }
 
@@ -440,13 +577,11 @@ func extractEmailAddress(header string) string {
 	if header == "" {
 		return ""
 	}
-
 	if start := strings.LastIndex(header, "<"); start != -1 {
 		if end := strings.LastIndex(header, ">"); end > start {
 			return strings.ToLower(header[start+1 : end])
 		}
 	}
-
 	return strings.ToLower(strings.TrimSpace(header))
 }
 
@@ -459,7 +594,6 @@ func extractBody(payload *gmail.MessagePart) string {
 			}
 		}
 	}
-
 	if payload.Parts != nil {
 		for _, part := range payload.Parts {
 			if part.MimeType == "text/html" && part.Body != nil && part.Body.Data != "" {
@@ -469,7 +603,6 @@ func extractBody(payload *gmail.MessagePart) string {
 				}
 			}
 		}
-
 		for _, part := range payload.Parts {
 			if part.MimeType == "text/plain" && part.Body != nil && part.Body.Data != "" {
 				data, err := base64.URLEncoding.DecodeString(part.Body.Data)
@@ -478,7 +611,6 @@ func extractBody(payload *gmail.MessagePart) string {
 				}
 			}
 		}
-
 		for _, part := range payload.Parts {
 			if strings.HasPrefix(part.MimeType, "multipart/") && part.Parts != nil {
 				if body := extractBody(part); body != "" {
@@ -487,7 +619,6 @@ func extractBody(payload *gmail.MessagePart) string {
 			}
 		}
 	}
-
 	return ""
 }
 
@@ -499,7 +630,7 @@ func extractProductName(body string) string {
 	return "Unknown Product"
 }
 
-func generateReportData(orders []Order) ReportData {
+func generateReportData(orders []Order, fedexAccessToken string) ReportData { // Added fedexAccessToken param
 	reportTimestamp := time.Now().Format(time.RFC1123)
 	if len(orders) == 0 {
 		log.Println("No orders to process for report data generation")
@@ -609,8 +740,7 @@ func generateReportData(orders []Order) ReportData {
 	})
 
 	var shippedOrdersData []ShippedOrderData
-	// Concurrently process tracking links
-	type trackingLinkJob struct {
+	type shipmentDetailJob struct {
 		Email          string
 		OrderID        string
 		ProductName    string
@@ -622,33 +752,35 @@ func generateReportData(orders []Order) ReportData {
 		numShippedOrders += len(orderMap)
 	}
 
-	jobs := make(chan trackingLinkJob, numShippedOrders)
+	jobs := make(chan shipmentDetailJob, numShippedOrders)
 	results := make(chan ShippedOrderData, numShippedOrders)
-	var wgLinks sync.WaitGroup
+	var wgShipmentDetails sync.WaitGroup
 
-	// Start workers for getTrackingLink
-	// Using numWorkers for this as well, can be tuned.
-	for w := 0; w < numWorkers; w++ {
-		wgLinks.Add(1)
+	for w := 0; w < shipmentDetailWorkers; w++ {
+		wgShipmentDetails.Add(1)
 		go func() {
-			defer wgLinks.Done()
+			defer wgShipmentDetails.Done()
 			for job := range jobs {
 				link := getTrackingLink(job.TrackingNumber)
+				status := "N/A" // Default status
+				if isFedexTrackingNumber(job.TrackingNumber) {
+					status = getFedexShipmentStatus(job.TrackingNumber, fedexAccessToken) // Pass token
+				}
 				results <- ShippedOrderData{
 					Email:          job.Email,
 					OrderID:        job.OrderID,
 					ProductName:    job.ProductName,
 					TrackingNumber: job.TrackingNumber,
 					TrackingLink:   link,
+					ShipmentStatus: status,
 				}
 			}
 		}()
 	}
 
-	// Send jobs
 	for email, orderMap := range shippedOrdersInfo {
 		for orderID, orderDetails := range orderMap {
-			jobs <- trackingLinkJob{
+			jobs <- shipmentDetailJob{
 				Email:          email,
 				OrderID:        orderID,
 				ProductName:    orderDetails.ProductName,
@@ -658,12 +790,8 @@ func generateReportData(orders []Order) ReportData {
 	}
 	close(jobs)
 
-	// Collect results
-	// wgLinks.Wait() should be called after closing results channel
-	// but we need to collect results first.
-	// A separate goroutine to close results channel once all workers are done.
 	go func() {
-		wgLinks.Wait()
+		wgShipmentDetails.Wait()
 		close(results)
 	}()
 
@@ -705,28 +833,6 @@ func generateReportData(orders []Order) ReportData {
 		return pendingShipmentData[i].OrderID < pendingShipmentData[j].OrderID
 	})
 
-	// Logic for AwaitingShipmentOrders (Not Cancelled, No Shipping Email)
-	// This is subtly different from PendingShipmentOrders.
-	// PendingShipmentOrders = Confirmed AND NOT Cancelled AND NOT Shipped (based on *any* shipping email for that order ID)
-	// AwaitingShipmentOrders = Confirmed AND NOT Cancelled AND (No Shipping Email *at all* for that order ID from *any* source)
-	// For this task, "we still don't have a shipping email for" implies checking against shippedOrdersInfo.
-	// The existing PendingShipmentOrders logic already covers this.
-	// Let's rename PendingShipmentOrders to AwaitingShipmentNoEmail to be more precise
-	// and then ensure the logic correctly populates it.
-	// The request is "all the orders that were not cancelled but we still don't have a shipping email for."
-	// This is exactly what `pendingShipmentData` currently calculates.
-	// So, we will use `pendingShipmentData` for the new `AwaitingShipmentOrders` field
-	// and remove the `PendingShipmentOrders` field from ReportData as it's redundant with the new request.
-
-	// Re-evaluating: The user asked for "another section".
-	// `PendingShipmentOrders` is defined as: confirmed, not cancelled, not shipped.
-	// The new request: "not cancelled but we still don't have a shipping email for".
-	// These two are identical if "shipped" means "has a shipping email".
-	// Let's assume the existing `PendingShipmentOrders` is what they want in this new section.
-	// To avoid confusion and make it explicit, I will populate `AwaitingShipmentOrders` with the same data
-	// as `PendingShipmentOrders`. The user can then decide if they want to remove the old "Pending Shipment" section
-	// from the template later if it's truly redundant.
-
 	var awaitingShipmentData []AwaitingShipmentData
 	for email, orderMap := range confirmedByEmail {
 		for orderID, productName := range orderMap {
@@ -734,34 +840,19 @@ func generateReportData(orders []Order) ReportData {
 			if cancelMap, exists := canceledByEmail[email]; exists && cancelMap[orderID] {
 				isCanceled = true
 			}
-
-			// Check if a shipping email exists for this specific orderID and email
-			// AND if that shipping email is effectively for the 'productName' from the confirmation.
-			productNameFromConfirmation := productName // productName is from confirmedByEmail[email][orderID]
-
+			productNameFromConfirmation := productName
 			shippedAsThisProduct := false
 			if shippingDetails, shippingRecordExists := shippedOrdersInfo[email][orderID]; shippingRecordExists {
-				// A shipping record exists for this (email, orderID).
-				// Now, determine the "effective" product name this shipping record contributes to in ProductStats.
-				effectiveShippedProductName := shippingDetails.ProductName // Start with product name from the shipping email.
-
+				effectiveShippedProductName := shippingDetails.ProductName
 				if effectiveShippedProductName == "" || strings.HasPrefix(effectiveShippedProductName, "Unknown Product") {
-					// If the shipping email's product name is generic,
-					// check if the original confirmation (productNameFromConfirmation) had a more specific name.
 					if productNameFromConfirmation != "" && !strings.HasPrefix(productNameFromConfirmation, "Unknown Product") {
 						effectiveShippedProductName = productNameFromConfirmation
 					}
-					// If both confirmation and shipping names were generic, effectiveShippedProductName remains the generic one from the shipping email.
 				}
-				// Now, effectiveShippedProductName is the name that this shipped item would be tallied under in ProductStats.
-
 				if effectiveShippedProductName == productNameFromConfirmation {
-					// The item was shipped and its shipping record (after reconciliation) matches the confirmed product.
 					shippedAsThisProduct = true
 				}
 			}
-			// If no shippingRecordExists for this (email, orderID), shippedAsThisProduct remains false.
-
 			if !isCanceled && !shippedAsThisProduct {
 				awaitingShipmentData = append(awaitingShipmentData, AwaitingShipmentData{
 					Email:       email,
@@ -803,7 +894,6 @@ func generateReportData(orders []Order) ReportData {
 
 	var topNonCancelled []EmailStatData
 	var onlyCancellations []EmailStatData
-
 	sort.Slice(emailStatsList, func(i, j int) bool {
 		return emailStatsList[i].NonCanceled > emailStatsList[j].NonCanceled
 	})
@@ -821,8 +911,8 @@ func generateReportData(orders []Order) ReportData {
 		Overall:                overallData,
 		ProductStats:           productStatsData,
 		ShippedOrders:          shippedOrdersData,
-		PendingShipmentOrders:  pendingShipmentData,  // Keep this for now, user might still want it
-		AwaitingShipmentOrders: awaitingShipmentData, // Populate the new field
+		PendingShipmentOrders:  pendingShipmentData,
+		AwaitingShipmentOrders: awaitingShipmentData,
 		EmailStats: EmailStatsDataContainer{
 			TopNonCancelled:   topNonCancelled,
 			OnlyCancellations: onlyCancellations,
@@ -844,8 +934,8 @@ func writeCSVStats(data ReportData) {
 	writeOverallStatsCSV(writer, data.Overall)
 	writeProductStatsCSV(writer, data.ProductStats)
 	writeShippedOrdersListCSV(writer, data.ShippedOrders)
-	writePendingShipmentOrdersCSV(writer, data.PendingShipmentOrders)   // Keep existing
-	writeAwaitingShipmentOrdersCSV(writer, data.AwaitingShipmentOrders) // Add new
+	writePendingShipmentOrdersCSV(writer, data.PendingShipmentOrders)
+	writeAwaitingShipmentOrdersCSV(writer, data.AwaitingShipmentOrders)
 	writeEmailStatsCSV(writer, data.EmailStats)
 
 	log.Printf("CSV statistics written to %s", filename)
@@ -858,10 +948,10 @@ func writeOverallStatsCSV(writer *csv.Writer, overall OverallStatsData) {
 	writer.Write([]string{"Total Cancellations", fmt.Sprintf("%d", overall.TotalCancellations)})
 	writer.Write([]string{"Total Non-Cancelled Orders", fmt.Sprintf("%d", overall.TotalNonCancelled)})
 	writer.Write([]string{"Total Shipped Orders", fmt.Sprintf("%d", overall.TotalShipped)})
+	writer.Write([]string{""}) // Add empty line for spacing
 }
 
 func writeProductStatsCSV(writer *csv.Writer, productStats []ProductStatData) {
-	writer.Write([]string{""})
 	writer.Write([]string{"Per-Product Stats"})
 	writer.Write([]string{"Product", "Total Confirmed", "Non-Cancelled", "Shipped", "Stick Rate (%)"})
 	for _, p := range productStats {
@@ -877,17 +967,15 @@ func writeProductStatsCSV(writer *csv.Writer, productStats []ProductStatData) {
 }
 
 func writeShippedOrdersListCSV(writer *csv.Writer, shippedOrders []ShippedOrderData) {
-	writer.Write([]string{""})
 	writer.Write([]string{"Shipped Orders Details"})
-	writer.Write([]string{"Email", "Order ID", "Product Name", "Tracking Number", "Tracking Link"})
+	writer.Write([]string{"Email", "Order ID", "Product Name", "Tracking Number", "Tracking Link", "Shipment Status"}) // Added Shipment Status
 	for _, entry := range shippedOrders {
-		writer.Write([]string{entry.Email, entry.OrderID, entry.ProductName, entry.TrackingNumber, entry.TrackingLink})
+		writer.Write([]string{entry.Email, entry.OrderID, entry.ProductName, entry.TrackingNumber, entry.TrackingLink, entry.ShipmentStatus}) // Added entry.ShipmentStatus
 	}
 	writer.Write([]string{""})
 }
 
 func writePendingShipmentOrdersCSV(writer *csv.Writer, pendingOrders []PendingShipmentData) {
-	writer.Write([]string{""})
 	writer.Write([]string{"Confirmed Orders - Pending Shipment (Not Canceled)"})
 	writer.Write([]string{"Email", "Order ID", "Product Name"})
 	for _, entry := range pendingOrders {
@@ -897,7 +985,6 @@ func writePendingShipmentOrdersCSV(writer *csv.Writer, pendingOrders []PendingSh
 }
 
 func writeAwaitingShipmentOrdersCSV(writer *csv.Writer, awaitingOrders []AwaitingShipmentData) {
-	writer.Write([]string{""})
 	writer.Write([]string{"Orders Not Cancelled & No Shipping Email Yet"})
 	writer.Write([]string{"Email", "Order ID", "Product Name"})
 	for _, entry := range awaitingOrders {
@@ -907,9 +994,7 @@ func writeAwaitingShipmentOrdersCSV(writer *csv.Writer, awaitingOrders []Awaitin
 }
 
 func writeEmailStatsCSV(writer *csv.Writer, emailStats EmailStatsDataContainer) {
-	writer.Write([]string{""})
 	writer.Write([]string{"Per-Email Account Stats"})
-
 	writer.Write([]string{""})
 	writer.Write([]string{"Top Accounts by Non-Cancelled Orders"})
 	writer.Write([]string{"Email Address", "Non-Cancelled Orders", "Total Cancellations"})
@@ -920,8 +1005,6 @@ func writeEmailStatsCSV(writer *csv.Writer, emailStats EmailStatsDataContainer) 
 			fmt.Sprintf("%d", stat.TotalCancellations),
 		})
 	}
-	writer.Write([]string{""})
-
 	writer.Write([]string{""})
 	writer.Write([]string{"Accounts with Only Cancellations (No Non-Cancelled Orders)"})
 	writer.Write([]string{"Email Address", "Total Cancellations", "Non-Cancelled Orders"})
@@ -940,7 +1023,6 @@ func writeHTMLReport(data ReportData) {
 	if err != nil {
 		log.Fatalf("Failed to parse HTML template: %v", err)
 	}
-
 	timestamp := time.Now().Format("20060102_150405")
 	filename := fmt.Sprintf("%s_%s.html", htmlFileBaseName, timestamp)
 	file, err := os.Create(filename)
@@ -948,7 +1030,6 @@ func writeHTMLReport(data ReportData) {
 		log.Fatalf("Failed to create HTML report file: %v", err)
 	}
 	defer file.Close()
-
 	err = tmpl.Execute(file, data)
 	if err != nil {
 		log.Fatalf("Failed to execute HTML template: %v", err)
