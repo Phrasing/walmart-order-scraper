@@ -25,16 +25,18 @@ import (
 	"golang.org/x/oauth2/google"
 	"google.golang.org/api/gmail/v1"
 	"google.golang.org/api/option"
+
+	"github.com/joho/godotenv" // Added for .env file loading
 )
 
 const (
 	tokenFile             = "token.json"
 	credentialsFile       = "credentials.json"
 	emailQuery            = "from:help@walmart.com newer_than:30d"
-	numWorkers            = 3
+	numWorkers            = 2 // Reduced from 8 to 2 to lower Gmail API call rate
 	maxRetryAttempts      = 3
 	baseRetrySleep        = time.Second
-	apiRateDelayMs        = 50
+	apiRateDelayMs        = 250 // Increased from 50 to 250 to lower Gmail API call rate
 	csvFileBaseName       = "walmart_order_stats"
 	htmlFileBaseName      = "walmart_order_report"
 	fedexTokenURL         = "https://apis.fedex.com/oauth/token"
@@ -72,12 +74,14 @@ type ProductStatData struct {
 
 // ShippedOrderData (ShipmentStatus field was already added)
 type ShippedOrderData struct {
-	Email          string
-	OrderID        string
-	ProductName    string
-	TrackingNumber string
-	TrackingLink   string
-	ShipmentStatus string
+	Email                       string
+	OrderID                     string
+	ProductName                 string
+	TrackingNumber              string
+	TrackingLink                string
+	ShipmentStatus              string
+	EstimatedDeliveryDate       string    // Will store the formatted, human-readable date
+	parsedEstimatedDeliveryDate time.Time // For sorting
 }
 
 // PendingShipmentData (remains the same)
@@ -128,6 +132,11 @@ type FedexOauthTokenResponse struct {
 }
 
 // Structs for parsing FedEx Tracking API JSON output (adapted from FedexMcpResponse)
+type TrackingDateAndTime struct {
+	DateTime string `json:"dateTime"`
+	Type     string `json:"type"`
+}
+
 type FedexTrackingApiResponse struct {
 	TransactionID string `json:"transactionId"`
 	Output        struct {
@@ -138,6 +147,7 @@ type FedexTrackingApiResponse struct {
 					DerivedStatus  string `json:"derivedStatus"`
 					Description    string `json:"description"`
 				} `json:"latestStatusDetail"`
+				DateAndTimes []TrackingDateAndTime `json:"dateAndTimes"` // Added for estimated delivery date
 				// We might need more fields later, but this is enough for status
 			} `json:"trackResults"`
 		} `json:"completeTrackResults"`
@@ -214,12 +224,23 @@ func getFedexAccessToken(clientID, clientSecret string) (string, error) {
 	return tokenResponse.AccessToken, nil
 }
 
-func getFedexShipmentStatus(trackingNumber, accessToken string) string {
+// FedexShipmentDetails holds status, raw estimated delivery date string, and parsed time.Time object
+type FedexShipmentDetails struct {
+	Status                      string
+	EstimatedDeliveryDate       string    // Raw date string from API
+	ParsedEstimatedDeliveryDate time.Time // Parsed date for internal use/sorting
+}
+
+func getFedexShipmentDetails(trackingNumber, accessToken string) (FedexShipmentDetails, error) {
+	details := FedexShipmentDetails{Status: "N/A", EstimatedDeliveryDate: "N/A", ParsedEstimatedDeliveryDate: time.Time{}} // Initialize ParsedEstimatedDeliveryDate to zero
+
 	if !isFedexTrackingNumber(trackingNumber) {
-		return "Non-FedEx / N/A"
+		details.Status = "Non-FedEx / N/A"
+		return details, nil // Not an error, just not a FedEx number
 	}
 	if accessToken == "" {
-		return "Auth Error (No Token)"
+		details.Status = "Auth Error (No Token)"
+		return details, fmt.Errorf("FedEx access token is empty")
 	}
 
 	payload := map[string]interface{}{
@@ -235,65 +256,161 @@ func getFedexShipmentStatus(trackingNumber, accessToken string) string {
 	jsonPayload, err := json.Marshal(payload)
 	if err != nil {
 		log.Printf("Error marshalling FedEx payload for %s: %v", trackingNumber, err)
-		return "Payload Error"
+		details.Status = "Payload Error"
+		return details, fmt.Errorf("error marshalling payload for %s: %w", trackingNumber, err)
 	}
 
 	req, err := http.NewRequest("POST", fedexTrackingURL, bytes.NewBuffer(jsonPayload))
 	if err != nil {
 		log.Printf("Error creating FedEx tracking request for %s: %v", trackingNumber, err)
-		return "Request Creation Error"
+		details.Status = "Request Creation Error"
+		return details, fmt.Errorf("error creating request for %s: %w", trackingNumber, err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 
-	client := &http.Client{Timeout: 15 * time.Second} // Increased timeout for API call
+	client := &http.Client{Timeout: 15 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		log.Printf("Error calling FedEx tracking API for %s: %v", trackingNumber, err)
-		return "API Call Error"
+		details.Status = "API Call Error"
+		return details, fmt.Errorf("error calling API for %s: %w", trackingNumber, err)
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		log.Printf("Error reading FedEx tracking response body for %s: %v", trackingNumber, err)
-		return "Response Read Error"
+		details.Status = "Response Read Error"
+		return details, fmt.Errorf("error reading response body for %s: %w", trackingNumber, err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
 		log.Printf("FedEx tracking API error for %s: %s. Body: %s", trackingNumber, resp.Status, string(body))
-		// Try to parse error from body
 		var apiError FedexTrackingApiResponse
 		if json.Unmarshal(body, &apiError) == nil && len(apiError.Errors) > 0 {
-			return fmt.Sprintf("API Error: %s - %s", apiError.Errors[0].Code, apiError.Errors[0].Message)
+			details.Status = fmt.Sprintf("API Error: %s - %s", apiError.Errors[0].Code, apiError.Errors[0].Message)
+			return details, fmt.Errorf("API error for %s: %s - %s", trackingNumber, apiError.Errors[0].Code, apiError.Errors[0].Message)
 		}
-		return fmt.Sprintf("API Error: %s", resp.Status)
+		details.Status = fmt.Sprintf("API Error: %s", resp.Status)
+		return details, fmt.Errorf("API error for %s: %s", trackingNumber, resp.Status)
 	}
 
 	var trackingResponse FedexTrackingApiResponse
 	if err := json.Unmarshal(body, &trackingResponse); err != nil {
 		log.Printf("Error unmarshalling FedEx tracking response for %s: %v. Raw: %s", trackingNumber, err, string(body))
-		return "Parse Error (API)"
+		details.Status = "Parse Error (API)"
+		return details, fmt.Errorf("error unmarshalling response for %s: %w. Raw: %s", trackingNumber, err, string(body))
 	}
 
 	if len(trackingResponse.Output.CompleteTrackResults) > 0 &&
 		len(trackingResponse.Output.CompleteTrackResults[0].TrackResults) > 0 {
-		statusDetail := trackingResponse.Output.CompleteTrackResults[0].TrackResults[0].LatestStatusDetail
+		trackResult := trackingResponse.Output.CompleteTrackResults[0].TrackResults[0]
+		statusDetail := trackResult.LatestStatusDetail
 		if statusDetail.StatusByLocale != "" {
-			return statusDetail.StatusByLocale
+			details.Status = statusDetail.StatusByLocale
+		} else if statusDetail.DerivedStatus != "" {
+			details.Status = statusDetail.DerivedStatus
+		} else if statusDetail.Description != "" {
+			details.Status = statusDetail.Description
 		}
-		if statusDetail.DerivedStatus != "" {
-			return statusDetail.DerivedStatus
+
+		for _, dt := range trackResult.DateAndTimes {
+			if dt.Type == "ESTIMATED_DELIVERY" {
+				details.EstimatedDeliveryDate = dt.DateTime // Store raw date string
+
+				// Attempt to parse it for sorting
+				layouts := []string{
+					"2006-01-02T15:04:05-07:00",
+					"2006-01-02T15:04:05Z",
+					"2006-01-02T15:04:05",
+					"2006-01-02",
+				}
+				parsed := false
+				for _, layout := range layouts {
+					parsedTime, err := time.Parse(layout, dt.DateTime)
+					if err == nil {
+						details.ParsedEstimatedDeliveryDate = parsedTime
+						parsed = true
+						break
+					}
+				}
+				if !parsed {
+					log.Printf("Could not parse estimated delivery date '%s' for tracking number %s", dt.DateTime, trackingNumber)
+					details.ParsedEstimatedDeliveryDate = time.Time{} // Ensure it's zero if unparseable
+				}
+				break // Found the estimated delivery date
+			}
 		}
-		if statusDetail.Description != "" { // Fallback to description
-			return statusDetail.Description
-		}
-	}
-	if len(trackingResponse.Output.Alerts) > 0 { // Check for alerts if no results
-		return fmt.Sprintf("Alert: %s", trackingResponse.Output.Alerts[0].Message)
+	} else if len(trackingResponse.Output.Alerts) > 0 {
+		details.Status = fmt.Sprintf("Alert: %s", trackingResponse.Output.Alerts[0].Message)
 	}
 
-	return "Status N/A"
+	return details, nil
+}
+
+func formatDeliveryDate(dateStr string) string {
+	if dateStr == "" || dateStr == "N/A" {
+		return "N/A"
+	}
+
+	// Try to parse the date string. FedEx might return just a date or a full timestamp.
+	// Common formats: "YYYY-MM-DD", "YYYY-MM-DDTHH:MM:SS", "YYYY-MM-DDTHH:MM:SSZ", "YYYY-MM-DDTHH:MM:SS+HH:MM"
+	layouts := []string{
+		"2006-01-02T15:04:05-07:00", // Full timestamp with offset
+		"2006-01-02T15:04:05Z",      // Full timestamp UTC
+		"2006-01-02T15:04:05",       // Full timestamp without offset (assume local or UTC based on context)
+		"2006-01-02",                // Date only
+	}
+
+	var deliveryTime time.Time
+	var parseErr error
+	parsed := false
+	for _, layout := range layouts {
+		deliveryTime, parseErr = time.Parse(layout, dateStr)
+		if parseErr == nil {
+			parsed = true
+			break
+		}
+	}
+
+	if !parsed {
+		log.Printf("Error parsing date string '%s': %v. Returning original.", dateStr, parseErr)
+		// Fallback to a simpler date format if direct parsing failed but it might be a simple date
+		parts := strings.Split(dateStr, "T")
+		if len(parts) > 0 {
+			return parts[0] // Return YYYY-MM-DD part
+		}
+		return dateStr // Return original if all parsing fails
+	}
+
+	// Ensure we are comparing dates in the same location (e.g., local time)
+	// For simplicity, let's use the server's local time for "today" and "tomorrow" comparisons.
+	// FedEx dates might be UTC or local to the destination. For this formatting,
+	// comparing date parts (Year, Month, Day) is usually sufficient.
+	now := time.Now()
+	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	tomorrow := today.AddDate(0, 0, 1)
+
+	// Normalize deliveryTime to just date part for comparison
+	deliveryDateOnly := time.Date(deliveryTime.Year(), deliveryTime.Month(), deliveryTime.Day(), 0, 0, 0, 0, now.Location())
+
+	if deliveryDateOnly.Equal(today) {
+		return "Arriving Today"
+	}
+	if deliveryDateOnly.Equal(tomorrow) {
+		return "Arriving Tomorrow"
+	}
+
+	// For dates within the next week (but not today/tomorrow)
+	nextWeek := today.AddDate(0, 0, 7)
+	if deliveryDateOnly.After(tomorrow) && deliveryDateOnly.Before(nextWeek) {
+		return "Arriving " + deliveryTime.Format("Monday, Jan 2") // e.g., Arriving Wednesday, May 21
+	}
+
+	// For other future dates or if it's a past date (though less likely for "estimated")
+	// Could also check if deliveryTime is before today and format as "Delivered..." if status matches
+	return "Arriving " + deliveryTime.Format("Mon, Jan 2, 2006") // e.g., Arriving May 22, 2025
 }
 
 func getTrackingLink(trackingNumber string) string {
@@ -321,6 +438,12 @@ func getTrackingLink(trackingNumber string) string {
 
 func main() {
 	ctx := context.Background()
+
+	// Load .env file
+	err := godotenv.Load()
+	if err != nil {
+		log.Println("Warning: Error loading .env file, relying on environment variables")
+	}
 
 	fedexClientID := os.Getenv("FEDEX_CLIENT_ID")
 	fedexClientSecret := os.Getenv("FEDEX_CLIENT_SECRET")
@@ -762,17 +885,28 @@ func generateReportData(orders []Order, fedexAccessToken string) ReportData { //
 			defer wgShipmentDetails.Done()
 			for job := range jobs {
 				link := getTrackingLink(job.TrackingNumber)
-				status := "N/A" // Default status
+				shipmentDetails := FedexShipmentDetails{Status: "N/A", EstimatedDeliveryDate: "N/A", ParsedEstimatedDeliveryDate: time.Time{}}
+				var err error
+
 				if isFedexTrackingNumber(job.TrackingNumber) {
-					status = getFedexShipmentStatus(job.TrackingNumber, fedexAccessToken) // Pass token
+					shipmentDetails, err = getFedexShipmentDetails(job.TrackingNumber, fedexAccessToken) // Pass token
+					if err != nil {
+						log.Printf("Error getting FedEx shipment details for %s: %v", job.TrackingNumber, err)
+						// shipmentDetails.Status will contain an error message
+					}
 				}
+
+				formattedDeliveryDate := formatDeliveryDate(shipmentDetails.EstimatedDeliveryDate)
+
 				results <- ShippedOrderData{
-					Email:          job.Email,
-					OrderID:        job.OrderID,
-					ProductName:    job.ProductName,
-					TrackingNumber: job.TrackingNumber,
-					TrackingLink:   link,
-					ShipmentStatus: status,
+					Email:                       job.Email,
+					OrderID:                     job.OrderID,
+					ProductName:                 job.ProductName,
+					TrackingNumber:              job.TrackingNumber,
+					TrackingLink:                link,
+					ShipmentStatus:              shipmentDetails.Status,
+					EstimatedDeliveryDate:       formattedDeliveryDate,                       // Use formatted date for display
+					parsedEstimatedDeliveryDate: shipmentDetails.ParsedEstimatedDeliveryDate, // Use parsed date for sorting
 				}
 			}
 		}()
@@ -800,6 +934,24 @@ func generateReportData(orders []Order, fedexAccessToken string) ReportData { //
 	}
 
 	sort.Slice(shippedOrdersData, func(i, j int) bool {
+		dateI := shippedOrdersData[i].parsedEstimatedDeliveryDate
+		dateJ := shippedOrdersData[j].parsedEstimatedDeliveryDate
+
+		isZeroI := dateI.IsZero()
+		isZeroJ := dateJ.IsZero()
+
+		if isZeroI && !isZeroJ { // N/A dates go last
+			return false
+		}
+		if !isZeroI && isZeroJ { // Valid dates go first
+			return true
+		}
+		if !isZeroI && !isZeroJ { // Both dates are valid, sort normally
+			if !dateI.Equal(dateJ) {
+				return dateI.Before(dateJ)
+			}
+		}
+		// If dates are equal or both are N/A, sort by Email then OrderID
 		if shippedOrdersData[i].Email != shippedOrdersData[j].Email {
 			return shippedOrdersData[i].Email < shippedOrdersData[j].Email
 		}
@@ -968,9 +1120,9 @@ func writeProductStatsCSV(writer *csv.Writer, productStats []ProductStatData) {
 
 func writeShippedOrdersListCSV(writer *csv.Writer, shippedOrders []ShippedOrderData) {
 	writer.Write([]string{"Shipped Orders Details"})
-	writer.Write([]string{"Email", "Order ID", "Product Name", "Tracking Number", "Tracking Link", "Shipment Status"}) // Added Shipment Status
+	writer.Write([]string{"Email", "Order ID", "Product Name", "Tracking Number", "Tracking Link", "Shipment Status", "Estimated Delivery Date"}) // Added Estimated Delivery Date
 	for _, entry := range shippedOrders {
-		writer.Write([]string{entry.Email, entry.OrderID, entry.ProductName, entry.TrackingNumber, entry.TrackingLink, entry.ShipmentStatus}) // Added entry.ShipmentStatus
+		writer.Write([]string{entry.Email, entry.OrderID, entry.ProductName, entry.TrackingNumber, entry.TrackingLink, entry.ShipmentStatus, entry.EstimatedDeliveryDate}) // Added entry.EstimatedDeliveryDate
 	}
 	writer.Write([]string{""})
 }
