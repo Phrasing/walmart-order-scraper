@@ -75,6 +75,7 @@
                     <th>Product Name</th>
                     <th>Tracking Number</th>
                     <th>Shipment Status</th>
+                    <th>Estimated Delivery Date</th>
                 </tr>
             </thead>
             <tbody>
@@ -91,10 +92,11 @@
                         {{end}}
                     </td>
                     <td>{{.ShipmentStatus}}</td>
+                    <td>{{.EstimatedDeliveryDate}}</td>
                 </tr>
                 {{end}}
                  {{if not .ShippedOrders}}
-                <tr><td colspan="5">No shipped orders found.</td></tr>
+                <tr><td colspan="6">No shipped orders found.</td></tr>
                 {{end}}
             </tbody>
         </table>
