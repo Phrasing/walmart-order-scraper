@@ -65,11 +65,13 @@ type OverallStatsData struct {
 
 // ProductStatData (remains the same)
 type ProductStatData struct {
-	Name        string
-	Confirmed   int
-	NonCanceled int
-	Shipped     int
-	StickRate   float64
+	Name               string
+	Confirmed          int
+	NonCanceled        int
+	Shipped            int
+	ShippedDelivered   int // New field
+	ShippedOtherStatus int // New field
+	StickRate          float64
 }
 
 // ShippedOrderData (ShipmentStatus field was already added)
@@ -808,9 +810,11 @@ func generateReportData(orders []Order, fedexAccessToken string) ReportData { //
 	}
 
 	productStatsMap := make(map[string]struct {
-		Confirmed   int
-		NonCanceled int
-		Shipped     int
+		Confirmed          int
+		NonCanceled        int
+		Shipped            int
+		ShippedDelivered   int // New field
+		ShippedOtherStatus int // New field
 	})
 	for email, orderMap := range confirmedByEmail {
 		for orderID, product := range orderMap {
@@ -851,11 +855,13 @@ func generateReportData(orders []Order, fedexAccessToken string) ReportData { //
 			stickRate = float64(stat.NonCanceled) / float64(stat.Confirmed) * 100
 		}
 		productStatsData = append(productStatsData, ProductStatData{
-			Name:        name,
-			Confirmed:   stat.Confirmed,
-			NonCanceled: stat.NonCanceled,
-			Shipped:     stat.Shipped,
-			StickRate:   stickRate,
+			Name:               name,
+			Confirmed:          stat.Confirmed,
+			NonCanceled:        stat.NonCanceled,
+			Shipped:            stat.Shipped,
+			ShippedDelivered:   stat.ShippedDelivered,   // New field
+			ShippedOtherStatus: stat.ShippedOtherStatus, // New field
+			StickRate:          stickRate,
 		})
 	}
 	sort.Slice(productStatsData, func(i, j int) bool {
@@ -932,6 +938,67 @@ func generateReportData(orders []Order, fedexAccessToken string) ReportData { //
 	for sod := range results {
 		shippedOrdersData = append(shippedOrdersData, sod)
 	}
+
+	// After shippedOrdersData is populated, update ShippedDelivered and ShippedOtherStatus
+	for _, sod := range shippedOrdersData {
+		productNameForStat := sod.ProductName
+		// Attempt to get a more accurate product name if the shipped one is generic
+		if orderConfirmations, emailExists := confirmedByEmail[sod.Email]; emailExists {
+			if confirmedProductName, orderExists := orderConfirmations[sod.OrderID]; orderExists {
+				if productNameForStat == "" || strings.HasPrefix(productNameForStat, "Unknown Product") {
+					if confirmedProductName != "" && !strings.HasPrefix(confirmedProductName, "Unknown Product") {
+						productNameForStat = confirmedProductName
+					}
+				}
+			}
+		}
+		if productNameForStat == "" {
+			productNameForStat = "Unknown Product (Shipped)"
+		}
+
+		// Retrieve the stat struct, modify it, then put it back.
+		// This is necessary because map access returns a copy of the struct.
+		if stat, ok := productStatsMap[productNameForStat]; ok {
+			if strings.Contains(strings.ToLower(sod.ShipmentStatus), "delivered") {
+				stat.ShippedDelivered++
+			} else if sod.ShipmentStatus != "N/A" && sod.ShipmentStatus != "Non-FedEx / N/A" && sod.ShipmentStatus != "" && !strings.Contains(strings.ToLower(sod.ShipmentStatus), "error") {
+				stat.ShippedOtherStatus++
+			}
+			productStatsMap[productNameForStat] = stat
+		} else {
+			// This case should ideally not happen if all products are first confirmed
+			// or if shipped products without prior confirmation are handled correctly
+			// when initially populating productStatsMap.
+			// However, to be safe, we can log or initialize a new entry.
+			// For now, let's assume products in shippedOrdersData will have an entry
+			// in productStatsMap from the earlier loops.
+			// If not, this logic might need adjustment to initialize a new stat entry.
+			log.Printf("Warning: Product '%s' from shipped order %s (email: %s) not found in productStatsMap during delivered/other status count.", productNameForStat, sod.OrderID, sod.Email)
+		}
+	}
+
+	// Re-populate productStatsData with the updated ShippedDelivered and ShippedOtherStatus counts
+	// The previous population of productStatsData happened before these counts were updated.
+	productStatsData = []ProductStatData{} // Clear the slice
+	for name, stat := range productStatsMap {
+		stickRate := 0.0
+		if stat.Confirmed > 0 {
+			stickRate = float64(stat.NonCanceled) / float64(stat.Confirmed) * 100
+		}
+		productStatsData = append(productStatsData, ProductStatData{
+			Name:               name,
+			Confirmed:          stat.Confirmed,
+			NonCanceled:        stat.NonCanceled,
+			Shipped:            stat.Shipped, // This is total shipped
+			ShippedDelivered:   stat.ShippedDelivered,
+			ShippedOtherStatus: stat.ShippedOtherStatus,
+			StickRate:          stickRate,
+		})
+	}
+	// Sort again after re-populating
+	sort.Slice(productStatsData, func(i, j int) bool {
+		return productStatsData[i].NonCanceled > productStatsData[j].NonCanceled
+	})
 
 	sort.Slice(shippedOrdersData, func(i, j int) bool {
 		dateI := shippedOrdersData[i].parsedEstimatedDeliveryDate
@@ -1105,13 +1172,15 @@ func writeOverallStatsCSV(writer *csv.Writer, overall OverallStatsData) {
 
 func writeProductStatsCSV(writer *csv.Writer, productStats []ProductStatData) {
 	writer.Write([]string{"Per-Product Stats"})
-	writer.Write([]string{"Product", "Total Confirmed", "Non-Cancelled", "Shipped", "Stick Rate (%)"})
+	writer.Write([]string{"Product", "Total Confirmed", "Non-Cancelled", "Shipped (Total)", "Shipped & Delivered", "Shipped & Other Status", "Stick Rate (%)"})
 	for _, p := range productStats {
 		writer.Write([]string{
 			p.Name,
 			fmt.Sprintf("%d", p.Confirmed),
 			fmt.Sprintf("%d", p.NonCanceled),
 			fmt.Sprintf("%d", p.Shipped),
+			fmt.Sprintf("%d", p.ShippedDelivered),
+			fmt.Sprintf("%d", p.ShippedOtherStatus),
 			fmt.Sprintf("%.2f", p.StickRate),
 		})
 	}

@@ -4,6 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Walmart Order Statistics Report</title>
+    <link rel="stylesheet" type="text/css" href="https://cdn.datatables.net/1.13.6/css/jquery.dataTables.min.css">
     <style>
         body { 
             font-family: Arial, sans-serif; 
@@ -23,6 +24,65 @@
         .overall-stats-list { list-style-type: none; padding-left: 0; }
         .overall-stats-list li { margin-bottom: 5px; }
         .overall-stats-list strong { min-width: 250px; display: inline-block; }
+
+        /* DataTables Dark Theme Adjustments */
+        .dataTables_wrapper .dataTables_length, 
+        .dataTables_wrapper .dataTables_filter {
+            color: #f0f0f0 !important;
+            margin-bottom: 10px; /* Added spacing */
+        }
+        .dataTables_wrapper .dataTables_info, 
+        .dataTables_wrapper .dataTables_processing, 
+        .dataTables_wrapper .dataTables_paginate {
+            color: #f0f0f0 !important;
+            margin-top: 10px; /* Added spacing */
+        }
+        .dataTables_wrapper .dataTables_length select {
+            background-color: #333;
+            color: #f0f0f0;
+            border: 1px solid #555;
+        }
+        .dataTables_wrapper .dataTables_filter input {
+            background-color: #333;
+            color: #f0f0f0;
+            border: 1px solid #555;
+            margin-left: 0.5em; /* Ensure proper spacing */
+        }
+        .dataTables_wrapper .dataTables_paginate .paginate_button {
+            color: #f0f0f0 !important; /* Important to override default */
+            border: 1px solid #555;
+            background-color: #333;
+            background: #333; /* Fallback */
+        }
+        .dataTables_wrapper .dataTables_paginate .paginate_button.disabled {
+            color: #777 !important;
+            border-color: #444;
+            background-color: #2a2a2a;
+            background: #2a2a2a;
+        }
+        .dataTables_wrapper .dataTables_paginate .paginate_button:hover {
+            border-color: #666;
+            background-color: #444;
+            background: #444;
+        }
+        .dataTables_wrapper .dataTables_paginate .paginate_button.current,
+        .dataTables_wrapper .dataTables_paginate .paginate_button.current:hover {
+            color: #fff !important;
+            border-color: #58a6ff;
+            background-color: #58a6ff;
+            background: #58a6ff;
+        }
+        table.dataTable th {
+            color: #f0f0f0 !important; /* Ensure header text is light */
+        }
+        table.dataTable td {
+             color: #f0f0f0 !important; /* Ensure cell text is light */
+        }
+        table.dataTable tr.odd { background-color: #2c2c2c; }
+        table.dataTable tr.even { background-color: #1e1e1e; }
+        table.dataTable tr.odd td { border-color: #444; }
+        table.dataTable tr.even td { border-color: #444; }
+
     </style>
 </head>
 <body>
@@ -41,13 +101,15 @@
 
     <div class="section">
         <h2>Per-Product Stats</h2>
-        <table>
+        <table id="productStatsTable">
             <thead>
                 <tr>
                     <th>Product</th>
                     <th>Total Confirmed</th>
                     <th>Non-Cancelled</th>
-                    <th>Shipped</th>
+                    <th>Shipped (Total)</th>
+                    <th>Shipped & Delivered</th>
+                    <th>Shipped & Other Status</th>
                     <th>Stick Rate (%)</th>
                 </tr>
             </thead>
@@ -58,6 +120,8 @@
                     <td>{{.Confirmed}}</td>
                     <td>{{.NonCanceled}}</td>
                     <td>{{.Shipped}}</td>
+                    <td>{{.ShippedDelivered}}</td>
+                    <td>{{.ShippedOtherStatus}}</td>
                     <td>{{printf "%.2f" .StickRate}}</td>
                 </tr>
                 {{end}}
@@ -67,7 +131,7 @@
 
     <div class="section">
         <h2>Shipped Orders Details</h2>
-        <table>
+        <table id="shippedOrdersTable">
             <thead>
                 <tr>
                     <th>Email</th>
@@ -95,16 +159,13 @@
                     <td>{{.EstimatedDeliveryDate}}</td>
                 </tr>
                 {{end}}
-                 {{if not .ShippedOrders}}
-                <tr><td colspan="6">No shipped orders found.</td></tr>
-                {{end}}
             </tbody>
         </table>
     </div>
 
     <div class="section">
         <h2>Confirmed Orders - Pending Shipment (Not Canceled)</h2>
-        <table>
+        <table id="pendingShipmentTable">
             <thead>
                 <tr>
                     <th>Email</th>
@@ -120,16 +181,13 @@
                     <td>{{.ProductName}}</td>
                 </tr>
                 {{end}}
-                {{if not .PendingShipmentOrders}}
-                <tr><td colspan="3">No orders pending shipment found.</td></tr>
-                {{end}}
             </tbody>
         </table>
     </div>
 
     <div class="section">
         <h2>Orders Not Cancelled & No Shipping Email Yet</h2>
-        <table>
+        <table id="awaitingShipmentTable">
             <thead>
                 <tr>
                     <th>Email</th>
@@ -145,9 +203,6 @@
                     <td>{{.ProductName}}</td>
                 </tr>
                 {{end}}
-                {{if not .AwaitingShipmentOrders}}
-                <tr><td colspan="3">No orders awaiting shipment email found.</td></tr>
-                {{end}}
             </tbody>
         </table>
     </div>
@@ -156,7 +211,7 @@
         <h2>Per-Email Account Stats</h2>
         
         <h3>Top Accounts by Non-Cancelled Orders</h3>
-        <table>
+        <table id="topAccountsTable">
             <thead>
                 <tr>
                     <th>Email Address</th>
@@ -172,14 +227,11 @@
                     <td>{{.TotalCancellations}}</td>
                 </tr>
                 {{end}}
-                {{if not .EmailStats.TopNonCancelled}}
-                <tr><td colspan="3">No accounts with non-cancelled orders.</td></tr>
-                {{end}}
             </tbody>
         </table>
 
         <h3>Accounts with Only Cancellations (No Non-Cancelled Orders)</h3>
-        <table>
+        <table id="onlyCancellationsTable">
             <thead>
                 <tr>
                     <th>Email Address</th>
@@ -195,12 +247,21 @@
                     <td>{{.NonCanceled}}</td>
                 </tr>
                 {{end}}
-                 {{if not .EmailStats.OnlyCancellations}}
-                <tr><td colspan="3">No accounts with only cancellations.</td></tr>
-                {{end}}
             </tbody>
         </table>
     </div>
 
+    <script src="https://code.jquery.com/jquery-3.7.0.js"></script>
+    <script src="https://cdn.datatables.net/1.13.6/js/jquery.dataTables.min.js"></script>
+    <script>
+        $(document).ready(function() {
+            $('#productStatsTable').DataTable();
+            $('#shippedOrdersTable').DataTable();
+            $('#pendingShipmentTable').DataTable();
+            $('#awaitingShipmentTable').DataTable();
+            $('#topAccountsTable').DataTable();
+            $('#onlyCancellationsTable').DataTable();
+        });
+    </script>
 </body>
 </html>
